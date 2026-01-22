@@ -63,9 +63,9 @@ class ActionMaskGenerator:
                 # Skip silently - the environment will handle these separately
                 pass
 
-        # If no valid actions but game not over, enable NOOP for auto-advance
-        if not mask.any() and not state.is_game_over():
-            mask[self.config.noop_idx] = True
+        # FIX 10: Removed redundant NOOP check here.
+        # The safety check in BusEnv.action_masks() handles this case
+        # unconditionally, which is safer and simpler.
 
         return mask
 

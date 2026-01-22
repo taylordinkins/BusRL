@@ -510,10 +510,20 @@ class GameEngine:
 
         Converts resolver-format actions to Action objects for the RL environment.
         The GUI uses ActionResolver directly, so this method is primarily for RL.
+
+        For RL training, we return a NOOP action that triggers auto-advance
+        through the resolution phase rather than exposing individual resolution choices.
         """
-        # For resolution phase, we need to use the action resolver
-        # Return empty if no resolver or not in resolution phase
-        return []
+        # For RL, return NOOP to trigger auto-resolution
+        # The environment's _auto_resolve_actions() handles the actual resolution
+        current_player_id = self.state.global_state.current_player_idx
+        return [
+            Action(
+                action_type=ActionType.PASS,
+                player_id=current_player_id,
+                params={"noop": True, "auto_resolve": True},
+            )
+        ]
 
     # -------------------------------------------------------------------------
     # Resolution Phase Support (for RL integration)
