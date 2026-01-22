@@ -135,10 +135,8 @@ class BusEnv(gym.Env):
         # leading to identical episodes across all environments.
 
         # Create new game
-        # Create new game
         self._engine = GameEngine()
-        seed_val = seed if seed is not None else 0
-        self._engine.reset(num_players=self.num_players, board=self._board.clone(), seed=seed_val)
+        self._engine.reset(num_players=self.num_players, board=self._board.clone())
 
         # Reset reward calculator
         self._reward_calculator.reset()
@@ -185,44 +183,29 @@ class BusEnv(gym.Env):
         self._step_count += 1
 
         # 2. Execute the action FIRST, then check stuck detection
-        # 2. Execute the action
         if action_obj.params.get("noop", False):
-            # NOOP action just triggers auto-advance
             self._auto_advance()
-            step_success = True
-            step_reward = {p.player_id: 0.0 for p in self._engine.state.players}
         else:
             # Execute the action
             step_result = self._engine.step(action_obj)
-            step_success = step_result.success
-            step_reward = step_result.reward
-            
+
+            if not step_result.success:
+                # Invalid action - return penalty
+                # Even though action failed, update _prev_state to current state
+                # (which should be unchanged from before). This keeps reward calculation
+                # consistent and prevents _prev_state from becoming stale.
+                self._prev_state = self._engine.state.clone()
+
+                info = self._build_info()
+                info["error"] = step_result.info.get("error", "Unknown error")
+                info["invalid_action"] = True
+                terminated = self._engine.is_game_over()
+                return self._get_observation(), self._reward_config.invalid_action_penalty, terminated, False, info
+
             # Action was successful, now auto-advance through automatic phases
-            if step_success:
-                self._auto_advance()
+            self._auto_advance()
 
-        # 3. Handle Invalid Actions
-        if not step_success:
-            # Invalid action - return penalty
-            # DO NOT update _prev_state, so the next valid action is compared against 
-            # the last valid state. This ensures "stones taken" or "score gained" 
-            # isn't zeroed out by an invalid intervening step.
-            
-            info = self._build_info()
-            info["error"] = step_result.info.get("error", "Unknown error")
-            info["invalid_action"] = True
-            
-            # Invalid action shouldn't advance game, so no need to check termination
-            # unless we want to enforce a max-retries logic (not implemented here)
-            terminated = self._engine.is_game_over()
-            
-            # Check truncation (max steps only) for invalid actions
-            truncated = self._step_count > self._max_steps
-            
-            return self._get_observation(), self._reward_config.invalid_action_penalty, terminated, truncated, info
-
-        # 4. Check Stuck Detection (Only on valid moves)
-        # Compute hash AFTER action and auto-advance
+        # 3. FIX 2: Check stuck detection AFTER action executes
         new_state_hash = self._engine.state.state_hash()
         if new_state_hash == self._last_state_hash:
             self._stuck_counter += 1
@@ -230,46 +213,39 @@ class BusEnv(gym.Env):
             self._stuck_counter = 0
             self._last_state_hash = new_state_hash
 
-        # 5. Check Termination and Truncation
-        # Note: _auto_advance() might have ended the game
+        # 4. Check termination/truncation after action and auto-advance
         terminated = self._engine.is_game_over()
+        # FIX 9: Use > instead of >= for correct max_steps behavior
         truncated = (self._step_count > self._max_steps) or (self._stuck_counter >= 50)
 
-        # 6. Compute Reward
-        # We compare current state (after action + auto-advance) vs previous state
+        # Compute reward for the acting player
         action_info = {"action_type": action_obj.action_type.value}
-        
-        # If the action was "Place Passenger" (which might trigger complex chain), 
-        # we want to capture the full delta.
         reward = self._reward_calculator.compute_reward(
             state=self._engine.state,
-            prev_state=prev_state,  # Use the state from start of step
+            prev_state=prev_state,
             player_id=acting_player,
             done=terminated,
             action_info=action_info,
         )
 
-        # 7. Update Previous State
-        # Only update if the step was successful (which we are here)
+        # Update previous state (this also covers truncation case - FIX 3)
         self._prev_state = self._engine.state.clone()
         self._current_player_at_step = self._engine.state.global_state.current_player_idx
 
-        # 8. Reset Stuck Counter if Round Changed?
-        # (Optional, but helps prevent false positives during long rounds)
-        
-        # Get new observation
+        # Get new observation (from new current player's perspective)
         obs = self._get_observation()
 
-        # Cache action mask
+        # FIX 7: Cache action mask to avoid computing multiple times
         self._cached_action_mask = self.action_masks()
 
-        # Build info
+        # Build info dict
         info = self._build_info()
         info["acting_player"] = acting_player
         info["reward_breakdown"] = self._reward_calculator.compute_reward_detailed(
             self._engine.state, prev_state, acting_player, terminated, action_info
         ).__dict__
 
+        # If terminal, log extra final info
         if terminated or truncated:
             info["game_over"] = True
 
@@ -342,10 +318,6 @@ class BusEnv(gym.Env):
         )
 
         # Manually trigger phase check to transition to CLEANUP
-        # Use public step() with NOOP if possible, or private method if necessary.
-        # Ideally, we should use a public method to "finish resolution".
-        # For now, we'll stick to _check_phase_transition() but we know it's internal.
-        # A better approach would be to have engine.resolve_all() do this.
         self._engine._check_phase_transition()
 
     def action_masks(self) -> np.ndarray:
