@@ -540,20 +540,38 @@ class MatchRunner:
     ) -> dict:
         """Run a single game with given policies.
 
-        For simplicity, this runs a 2-player game.
-
         Args:
-            policies: List of policies for each player slot.
+            policies: List of policies for each player slot (typically 2 for head-to-head).
             checkpoint_ids: IDs for each policy.
 
         Returns:
             Game result with final scores.
+
+        Note:
+            If the environment requires more than 2 players, extra slots will be
+            filled with copies of policy_b to make it policy_a vs N copies of policy_b.
         """
         env = self.env_factory()
 
-        # Force 2-player for evaluation
-        if hasattr(env, "num_players"):
-            env.num_players = len(policies)
+        # Get the required number of players from the environment
+        num_players = getattr(env, "num_players", len(policies))
+
+        # If we have exactly the right number of policies, use them directly
+        if len(policies) == num_players:
+            expanded_policies = policies
+            expanded_checkpoint_ids = checkpoint_ids
+        # If we have 2 policies but need more players, fill extra slots with policy_b
+        elif len(policies) == 2 and num_players > 2:
+            policy_a, policy_b = policies
+            checkpoint_id_a, checkpoint_id_b = checkpoint_ids
+            # Put policy_a in slot 0, fill rest with policy_b
+            expanded_policies = [policy_a] + [policy_b] * (num_players - 1)
+            expanded_checkpoint_ids = [checkpoint_id_a] + [f"{checkpoint_id_b}_slot{i}" for i in range(1, num_players)]
+        else:
+            raise ValueError(
+                f"Cannot run game: env requires {num_players} players but got {len(policies)} policies. "
+                f"Expected either {num_players} or 2 policies."
+            )
 
         obs, _ = env.reset()
         terminated = truncated = False
@@ -568,19 +586,20 @@ class MatchRunner:
             action_mask = env.action_masks()
 
             # Get action from current player's policy
-            policy = policies[current_player]
+            policy = expanded_policies[current_player]
             action, _ = policy.predict(obs, deterministic=True, action_masks=action_mask)
 
             obs, _, terminated, truncated, info = env.step(int(action))
 
         # Get final scores
         final_info = env._get_info() if hasattr(env, "_get_info") else info
-        scores = final_info.get("scores", {i: 0 for i in range(len(policies))})
+        scores = final_info.get("scores", {i: 0 for i in range(num_players)})
 
         env.close()
 
+        # Return only the scores for the original 2 policies (slots 0 and 1)
         return {
-            "scores": [scores.get(i, 0) for i in range(len(policies))],
+            "scores": [scores.get(0, 0), scores.get(1, 0)],
             "checkpoint_ids": checkpoint_ids,
         }
 

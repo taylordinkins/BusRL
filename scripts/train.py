@@ -83,24 +83,37 @@ def train(args):
             prune_strategy=args.prune_strategy,
         )
 
-        # Create Elo tracker
+        # Determine pool directory (use existing if provided, otherwise create new)
+        if args.load_pool_dir:
+            pool_dir = args.load_pool_dir
+            print(f"Loading existing opponent pool from: {pool_dir}")
+        else:
+            pool_dir = os.path.join(log_dir, "opponent_pool")
+            print(f"Creating new opponent pool at: {pool_dir}")
+
+        # Create Elo tracker (will load existing state if present)
         elo_tracker = EloTracker(
             k_factor=args.elo_k_factor,
             initial_elo=1500.0,
-            save_path=os.path.join(log_dir, "opponent_pool", "elo_state.json"),
+            save_path=os.path.join(pool_dir, "elo_state.json"),
         )
 
+        # Create opponent pool (will load existing checkpoints if present)
         opponent_pool = OpponentPool(
-            save_dir=os.path.join(log_dir, "opponent_pool"),
+            save_dir=pool_dir,
             config=pool_config,
             elo_tracker=elo_tracker,
         )
 
-        print(f"Opponent pool enabled:")
-        print(f"  Pool size: {args.pool_size}")
+        print(f"Opponent pool configuration:")
+        print(f"  Loaded checkpoints: {len(opponent_pool)}")
+        print(f"  Pool size limit: {args.pool_size}")
         print(f"  Save interval: {args.pool_save_interval}")
         print(f"  Prune strategy: {args.prune_strategy}")
         print(f"  Multi-policy mode: {args.multi_policy}")
+
+        if len(opponent_pool) > 0:
+            print(f"  Elo range: {opponent_pool.best_elo():.1f} - {opponent_pool.best_elo() - opponent_pool.elo_spread():.1f}")
 
     # Environment creation function
     def make_env(env_id: str, is_eval: bool = False):
@@ -330,6 +343,8 @@ if __name__ == "__main__":
     # Opponent pool args
     parser.add_argument("--use-opponent-pool", action="store_true",
                         help="Enable opponent pool for self-play diversity")
+    parser.add_argument("--load-pool-dir", type=str, default=None,
+                        help="Path to existing opponent pool directory to continue from (e.g., logs/ppo_bus_20260122_123456/opponent_pool)")
     parser.add_argument("--pool-size", type=int, default=20,
                         help="Max checkpoints in opponent pool")
     parser.add_argument("--pool-save-interval", type=int, default=50_000,
@@ -365,5 +380,22 @@ if __name__ == "__main__":
     if args.multi_policy and not args.use_opponent_pool:
         print("Warning: --multi-policy requires --use-opponent-pool. Enabling opponent pool.")
         args.use_opponent_pool = True
+
+    if args.load_pool_dir:
+        # Automatically enable opponent pool if loading from existing directory
+        if not args.use_opponent_pool:
+            print("Note: --load-pool-dir provided, automatically enabling --use-opponent-pool")
+            args.use_opponent_pool = True
+
+        # Validate that the directory exists
+        if not os.path.exists(args.load_pool_dir):
+            print(f"Error: Pool directory not found: {args.load_pool_dir}")
+            sys.exit(1)
+
+        # Check for pool state file
+        pool_state_path = os.path.join(args.load_pool_dir, "pool_state.json")
+        if not os.path.exists(pool_state_path):
+            print(f"Warning: No pool_state.json found in {args.load_pool_dir}")
+            print("This may not be a valid opponent pool directory, but continuing anyway...")
 
     train(args)
