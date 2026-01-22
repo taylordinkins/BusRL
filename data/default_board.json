@@ -1,0 +1,727 @@
+{
+    "nodes": [
+        {
+            "id": 0,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 0,
+                "y": 0
+            }
+        },
+        {
+            "id": 1,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 2,
+                "y": 0
+            }
+        },
+        {
+            "id": 2,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 4,
+                "y": 0
+            }
+        },
+        {
+            "id": 3,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 6,
+                "y": 0
+            }
+        },
+        {
+            "id": 4,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 8,
+                "y": 0
+            }
+        },
+        {
+            "id": 5,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 1,
+                "y": 1
+            }
+        },
+        {
+            "id": 6,
+            "building_slots": [
+                "B",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 3,
+                "y": 1
+            }
+        },
+        {
+            "id": 7,
+            "building_slots": [
+                "A",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 5,
+                "y": 1
+            }
+        },
+        {
+            "id": 8,
+            "building_slots": [],
+            "is_train_station": true,
+            "is_central_park": false,
+            "position": {
+                "x": 7,
+                "y": 1
+            }
+        },
+        {
+            "id": 9,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 9,
+                "y": 1
+            }
+        },
+        {
+            "id": 10,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 0,
+                "y": 2
+            }
+        },
+        {
+            "id": 11,
+            "building_slots": [
+                "A",
+                "A"
+            ],
+            "is_train_station": false,
+            "is_central_park": true,
+            "position": {
+                "x": 4,
+                "y": 2
+            }
+        },
+        {
+            "id": 12,
+            "building_slots": [
+                "A",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 6,
+                "y": 2
+            }
+        },
+        {
+            "id": 13,
+            "building_slots": [
+                "B",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 1,
+                "y": 3
+            }
+        },
+        {
+            "id": 14,
+            "building_slots": [
+                "A",
+                "A"
+            ],
+            "is_train_station": false,
+            "is_central_park": true,
+            "position": {
+                "x": 3,
+                "y": 3
+            }
+        },
+        {
+            "id": 15,
+            "building_slots": [
+                "A",
+                "A"
+            ],
+            "is_train_station": false,
+            "is_central_park": true,
+            "position": {
+                "x": 5,
+                "y": 3
+            }
+        },
+        {
+            "id": 16,
+            "building_slots": [
+                "B",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 7,
+                "y": 3
+            }
+        },
+        {
+            "id": 17,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 9,
+                "y": 3
+            }
+        },
+        {
+            "id": 18,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 0,
+                "y": 4
+            }
+        },
+        {
+            "id": 19,
+            "building_slots": [
+                "A",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 2,
+                "y": 4
+            }
+        },
+        {
+            "id": 20,
+            "building_slots": [
+                "A",
+                "A"
+            ],
+            "is_train_station": false,
+            "is_central_park": true,
+            "position": {
+                "x": 4,
+                "y": 4
+            }
+        },
+        {
+            "id": 21,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 6,
+                "y": 4
+            }
+        },
+        {
+            "id": 22,
+            "building_slots": [
+                "B",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 1,
+                "y": 5
+            }
+        },
+        {
+            "id": 23,
+            "building_slots": [
+                "A",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 3,
+                "y": 5
+            }
+        },
+        {
+            "id": 24,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 5,
+                "y": 5
+            }
+        },
+        {
+            "id": 25,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 7,
+                "y": 5
+            }
+        },
+        {
+            "id": 26,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 0,
+                "y": 6
+            }
+        },
+        {
+            "id": 27,
+            "building_slots": [],
+            "is_train_station": true,
+            "is_central_park": false,
+            "position": {
+                "x": 2,
+                "y": 6
+            }
+        },
+        {
+            "id": 28,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 4,
+                "y": 6
+            }
+        },
+        {
+            "id": 29,
+            "building_slots": [
+                "B",
+                "C"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 6,
+                "y": 6
+            }
+        },
+        {
+            "id": 30,
+            "building_slots": [
+                "B"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 1,
+                "y": 7
+            }
+        },
+        {
+            "id": 31,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 3,
+                "y": 7
+            }
+        },
+        {
+            "id": 32,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 5,
+                "y": 7
+            }
+        },
+        {
+            "id": 33,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 2,
+                "y": 8
+            }
+        },
+        {
+            "id": 34,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 6,
+                "y": 8
+            }
+        },
+        {
+            "id": 35,
+            "building_slots": [
+                "D"
+            ],
+            "is_train_station": false,
+            "is_central_park": false,
+            "position": {
+                "x": 7,
+                "y": 8
+            }
+        }
+    ],
+    "edges": [
+        [
+            0,
+            1
+        ],
+        [
+            0,
+            10
+        ],
+        [
+            1,
+            5
+        ],
+        [
+            1,
+            2
+        ],
+        [
+            2,
+            6
+        ],
+        [
+            2,
+            7
+        ],
+        [
+            2,
+            3
+        ],
+        [
+            3,
+            7
+        ],
+        [
+            3,
+            8
+        ],
+        [
+            4,
+            8
+        ],
+        [
+            4,
+            9
+        ],
+        [
+            5,
+            10
+        ],
+        [
+            5,
+            6
+        ],
+        [
+            6,
+            14
+        ],
+        [
+            6,
+            7
+        ],
+        [
+            7,
+            11
+        ],
+        [
+            7,
+            12
+        ],
+        [
+            7,
+            8
+        ],
+        [
+            8,
+            12
+        ],
+        [
+            8,
+            16
+        ],
+        [
+            8,
+            9
+        ],
+        [
+            8,
+            17
+        ],
+        [
+            9,
+            17
+        ],
+        [
+            10,
+            18
+        ],
+        [
+            10,
+            14
+        ],
+        [
+            11,
+            14
+        ],
+        [
+            11,
+            15
+        ],
+        [
+            12,
+            15
+        ],
+        [
+            12,
+            16
+        ],
+        [
+            13,
+            18
+        ],
+        [
+            13,
+            19
+        ],
+        [
+            13,
+            14
+        ],
+        [
+            14,
+            19
+        ],
+        [
+            14,
+            20
+        ],
+        [
+            15,
+            20
+        ],
+        [
+            15,
+            24
+        ],
+        [
+            15,
+            21
+        ],
+        [
+            16,
+            21
+        ],
+        [
+            16,
+            25
+        ],
+        [
+            16,
+            17
+        ],
+        [
+            18,
+            19
+        ],
+        [
+            18,
+            22
+        ],
+        [
+            19,
+            22
+        ],
+        [
+            19,
+            27
+        ],
+        [
+            19,
+            23
+        ],
+        [
+            20,
+            23
+        ],
+        [
+            20,
+            24
+        ],
+        [
+            21,
+            29
+        ],
+        [
+            21,
+            25
+        ],
+        [
+            22,
+            26
+        ],
+        [
+            22,
+            27
+        ],
+        [
+            23,
+            27
+        ],
+        [
+            23,
+            28
+        ],
+        [
+            24,
+            28
+        ],
+        [
+            24,
+            32
+        ],
+        [
+            24,
+            29
+        ],
+        [
+            25,
+            29
+        ],
+        [
+            25,
+            35
+        ],
+        [
+            26,
+            30
+        ],
+        [
+            26,
+            27
+        ],
+        [
+            27,
+            30
+        ],
+        [
+            27,
+            33
+        ],
+        [
+            27,
+            31
+        ],
+        [
+            28,
+            31
+        ],
+        [
+            28,
+            32
+        ],
+        [
+            29,
+            34
+        ],
+        [
+            32,
+            34
+        ],
+        [
+            31,
+            33
+        ],
+        [
+            32,
+            35
+        ],
+        [
+            34,
+            35
+        ]
+    ]
+}

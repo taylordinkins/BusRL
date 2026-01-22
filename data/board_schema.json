@@ -1,0 +1,74 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://bus-game/board-schema.json",
+    "title": "Bus Board Schema",
+    "description": "Schema for Bus game board topology definition",
+    "type": "object",
+    "required": ["nodes", "edges"],
+    "properties": {
+        "nodes": {
+            "type": "array",
+            "description": "List of nodes (intersections) on the board",
+            "items": {
+                "type": "object",
+                "required": ["id", "building_slots", "is_train_station", "is_central_park", "position"],
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Unique identifier for this node"
+                    },
+                    "building_slots": {
+                        "type": "array",
+                        "description": "Array of zone letters (A, B, C, D) indicating building slots",
+                        "items": {
+                            "type": "string",
+                            "enum": ["A", "B", "C", "D"]
+                        }
+                    },
+                    "is_train_station": {
+                        "type": "boolean",
+                        "description": "True if this node is a train station (passenger spawn point)"
+                    },
+                    "is_central_park": {
+                        "type": "boolean",
+                        "description": "True if this node is a central park (initial passenger location)"
+                    },
+                    "position": {
+                        "type": "object",
+                        "description": "Coordinates for visualization",
+                        "required": ["x", "y"],
+                        "properties": {
+                            "x": {
+                                "type": "number",
+                                "description": "X coordinate"
+                            },
+                            "y": {
+                                "type": "number",
+                                "description": "Y coordinate"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "additionalProperties": false
+            },
+            "minItems": 1
+        },
+        "edges": {
+            "type": "array",
+            "description": "List of edges (streets) connecting nodes",
+            "items": {
+                "type": "array",
+                "description": "Edge defined as [node_id_1, node_id_2]",
+                "items": {
+                    "type": "integer",
+                    "minimum": 0
+                },
+                "minItems": 2,
+                "maxItems": 2
+            }
+        }
+    },
+    "additionalProperties": false
+}
