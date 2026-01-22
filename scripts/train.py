@@ -128,9 +128,15 @@ def train(args):
 
     # Wrap for SB3
     env_factories = [make_env(f"train_{i}", is_eval=False) for i in range(args.n_envs)]
-    
+
     # Use SubprocVecEnv for better performance with multiple envs
-    if args.n_envs > 1:
+    # NOTE: Multi-policy mode requires DummyVecEnv because it needs to share
+    # the training_policy object across environments (not possible with multiprocessing)
+    if args.multi_policy:
+        env = DummyVecEnv(env_factories)
+        if args.n_envs > 1:
+            print(f"Note: Using DummyVecEnv instead of SubprocVecEnv for multi-policy mode")
+    elif args.n_envs > 1:
         env = SubprocVecEnv(env_factories)
     else:
         env = DummyVecEnv(env_factories)
@@ -224,6 +230,13 @@ def train(args):
     # Set training policy reference for multi-policy environments
     if args.multi_policy and opponent_pool is not None:
         # Access the wrapped environments and set training policy
+        # Note: This only works with DummyVecEnv (see env creation logic above)
+        if not hasattr(env, 'envs'):
+            raise RuntimeError(
+                "Multi-policy mode requires DummyVecEnv, but current env doesn't have .envs attribute. "
+                "This should not happen - check environment creation logic."
+            )
+
         for i in range(args.n_envs):
             wrapped_env = env.envs[i]
             # Navigate through wrapper stack to find MultiPolicyBusEnv
