@@ -2,6 +2,8 @@
 
 A high-performance, deterministic engine and Reinforcement Learning environment for the classic board game **Bus**. 
 
+Made almost exclusively with AI assistance (Claude, GPT, Gemini)
+
 This project provides a rule-complete implementation of the game, designed from the ground up to support both human play and advanced AI training using self-play and Prioritized Fictitious Self-Play (PFSP).
 
 ## 🚀 Overview
