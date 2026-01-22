@@ -1,2 +1,7 @@
 PySide6
 pytest
+gymnasium>=0.29.0
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0
+numpy>=1.24.0
+torch>=2.0.0

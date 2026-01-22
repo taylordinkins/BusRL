@@ -78,6 +78,3 @@ python scripts/evaluate.py --model-path logs/path_to_model --use-mcts
 
 ## 📝 Status
 The project is currently in an advanced state. Core rules, RL infrastructure, and the self-play training loop are fully implemented and verified with integration tests.
-
----
-*Developed as part of the Bus Digital & RL Project.*
