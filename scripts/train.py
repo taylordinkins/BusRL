@@ -147,15 +147,18 @@ def train(args):
     # the training_policy object across environments (not possible with multiprocessing)
     if args.multi_policy:
         env = DummyVecEnv(env_factories)
+        vec_env_class = DummyVecEnv
         if args.n_envs > 1:
             print(f"Note: Using DummyVecEnv instead of SubprocVecEnv for multi-policy mode")
     elif args.n_envs > 1:
         env = SubprocVecEnv(env_factories)
+        vec_env_class = SubprocVecEnv
     else:
         env = DummyVecEnv(env_factories)
+        vec_env_class = DummyVecEnv
 
-    # Evaluation environment (always uses self-play wrapper for consistent eval)
-    eval_env = DummyVecEnv([make_env("eval", is_eval=True)])
+    # Evaluation environment (uses same vec env type as training for consistency)
+    eval_env = vec_env_class([make_env("eval", is_eval=True)])
 
     # Callbacks
     callbacks = []
