@@ -29,12 +29,6 @@ class ActionMaskGenerator:
         action_mapping: "ActionMapping",
         config: ActionSpaceConfig = DEFAULT_ACTION_CONFIG,
     ):
-        """Initialize the mask generator.
-
-        Args:
-            action_mapping: ActionMapping instance for index conversion.
-            config: Action space configuration.
-        """
         self.action_mapping = action_mapping
         self.config = config
 
@@ -57,60 +51,48 @@ class ActionMaskGenerator:
         for action in valid_actions:
             try:
                 idx = self.action_mapping.action_to_index(action)
-                mask[idx] = True
-            except ValueError:
-                # Action not in our mapping (e.g., resolution actions not yet supported)
-                # Skip silently - the environment will handle these separately
-                pass
+            except ValueError as e:
+                # This MUST NOT be allowed to fail silently.
+                raise RuntimeError(
+                    f"Valid engine action {action} has no ActionMapping entry.\n"
+                    "Your action space is inconsistent with the game engine."
+                ) from e
 
-        # If no valid actions but game not over, enable NOOP for auto-advance
-        if not mask.any() and not state.is_game_over():
-            mask[self.config.noop_idx] = True
+            if not (0 <= idx < self.config.total_actions):
+                raise RuntimeError(
+                    f"ActionMapping produced out-of-bounds index {idx} for action {action}"
+                )
+
+            mask[idx] = True
+
+        # Fallback for forced auto-advance only
+        if not mask.any():
+            if state.is_game_over():
+                # Terminal state → allow NOOP so PPO has a legal action
+                mask[self.config.noop_idx] = True
+            else:
+                raise RuntimeError(
+                    "No valid actions produced for a non-terminal game state.\n"
+                    "This indicates a game engine or masking bug."
+                )
 
         return mask
 
     def get_valid_action_indices(self, mask: np.ndarray) -> np.ndarray:
-        """Get array of valid action indices from a mask.
-
-        Args:
-            mask: Boolean mask array.
-
-        Returns:
-            Array of indices where mask is True.
-        """
         return np.where(mask)[0]
 
-    def mask_to_logits_mask(
-        self,
-        mask: np.ndarray,
-        invalid_value: float = -1e8,
-    ) -> np.ndarray:
-        """Convert boolean mask to logits mask for policy networks.
+    def mask_to_logits_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Convert boolean mask to logits mask.
 
-        Args:
-            mask: Boolean mask (True = valid).
-            invalid_value: Value to use for invalid actions (large negative).
-
-        Returns:
-            Float array where valid actions = 0.0, invalid = invalid_value.
+        Valid actions → 0.0
+        Invalid actions → -inf (not -1e8!)
         """
-        logits_mask = np.where(mask, 0.0, invalid_value)
-        return logits_mask.astype(np.float32)
+        logits_mask = np.full(mask.shape, -np.inf, dtype=np.float32)
+        logits_mask[mask] = 0.0
+        return logits_mask
 
     def count_valid_actions(self, mask: np.ndarray) -> int:
-        """Count the number of valid actions in a mask."""
-        return int(np.sum(mask))
+        return int(mask.sum())
 
     def is_action_valid(self, action_idx: int, mask: np.ndarray) -> bool:
-        """Check if a specific action index is valid.
-
-        Args:
-            action_idx: The action index to check.
-            mask: Boolean mask array.
-
-        Returns:
-            True if the action is valid.
-        """
-        if 0 <= action_idx < len(mask):
-            return bool(mask[action_idx])
-        return False
+        return 0 <= action_idx < len(mask) and bool(mask[action_idx])
