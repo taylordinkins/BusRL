@@ -104,6 +104,8 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self_play_prob: float = 0.2,
         sampling_method: str = "pfsp",
         elo_tracker: Optional["EloTracker"] = None,
+        randomize_training_slot: bool = False,
+        self_play_checkpoint_path: Optional[str] = None,
     ):
         """Initialize the multi-policy wrapper.
 
@@ -111,24 +113,37 @@ class MultiPolicyBusEnv(gym.Wrapper):
             env: The base BusEnv environment.
             opponent_pool: Pool to sample opponents from. If None, pure self-play.
             training_slot: Player slot for the training policy (0 = first player).
+                If randomize_training_slot is True, this is used as the initial slot.
             self_play_prob: Probability of using current policy as opponent.
             sampling_method: How to sample from pool ("uniform", "pfsp", "elo_weighted").
             elo_tracker: Optional Elo tracker for rating updates after games.
+            randomize_training_slot: If True, randomize training slot each episode.
+                This helps the agent learn to play from any position.
+            self_play_checkpoint_path: Path to checkpoint for self-play opponents.
+                Required for SubprocVecEnv compatibility when self_play_prob > 0.
+                Each subprocess loads this checkpoint independently.
         """
         super().__init__(env)
 
         self.opponent_pool = opponent_pool
+        self._initial_training_slot = training_slot
         self.training_slot = training_slot
         self.self_play_prob = self_play_prob
         self.sampling_method = sampling_method
         self.elo_tracker = elo_tracker
+        self.randomize_training_slot = randomize_training_slot
+        self.self_play_checkpoint_path = self_play_checkpoint_path
 
         # Policy assignments for each player slot
         self._policy_slots: list[PolicySlot] = []
         self._num_players = getattr(env, "num_players", 4)
 
-        # Cached training policy reference (set externally)
+        # Cached training policy reference (set externally for DummyVecEnv)
+        # For SubprocVecEnv, use self_play_checkpoint_path instead
         self._training_policy: Optional["MaskablePPO"] = None
+
+        # Cached self-play policy loaded from checkpoint (for SubprocVecEnv)
+        self._self_play_checkpoint_policy: Optional["MaskablePPO"] = None
 
         # Track game outcomes for Elo updates
         self._current_episode_checkpoints: list[str] = []
@@ -162,6 +177,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
             Tuple of (observation, info) from training player's perspective.
         """
         obs, info = self.env.reset(seed=seed, options=options)
+
+        # Randomize training slot if enabled (learn to play from any position)
+        if self.randomize_training_slot:
+            self.training_slot = np.random.randint(0, self._num_players)
+        else:
+            self.training_slot = self._initial_training_slot
 
         # Assign policies to player slots
         self._assign_policies()
@@ -260,38 +281,115 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 policy_slot = self._sample_opponent_policy()
                 self._policy_slots.append(policy_slot)
 
+    def _create_frozen_copy(self, policy: "MaskablePPO") -> "MaskablePPO":
+        """Create a frozen copy of a policy for opponent use.
+
+        This ensures opponents use a snapshot of the current weights rather than
+        a live reference that changes as training progresses. This prevents
+        co-evolution where opponents and training policy evolve in lockstep.
+
+        Args:
+            policy: The policy to copy.
+
+        Returns:
+            A frozen copy of the policy with gradients disabled.
+        """
+        import copy
+
+        # Deep copy the policy to create independent weights
+        frozen = copy.deepcopy(policy)
+
+        # Put in evaluation mode (disables dropout, batch norm updates, etc.)
+        frozen.set_training_mode(False)
+
+        # Disable gradients on all parameters
+        for param in frozen.policy.parameters():
+            param.requires_grad = False
+
+        return frozen
+
+    def _get_self_play_policy(self) -> "MaskablePPO":
+        """Get a frozen policy for self-play opponents.
+
+        This method handles both DummyVecEnv (uses training_policy reference)
+        and SubprocVecEnv (loads from checkpoint path) scenarios.
+
+        Returns:
+            Frozen policy for self-play opponent, or None if unavailable.
+        """
+        # Option 1: Use training_policy reference (DummyVecEnv)
+        # Creates a fresh frozen copy each time to capture current weights
+        if self._training_policy is not None:
+            return self._create_frozen_copy(self._training_policy)
+
+        # Option 2: Load from checkpoint path (SubprocVecEnv)
+        # Reload each time to pick up updates from OpponentPoolCallback
+        if self.self_play_checkpoint_path is not None:
+            from sb3_contrib import MaskablePPO
+            import os
+
+            # Check both with and without .zip extension
+            path = self.self_play_checkpoint_path
+            if not path.endswith(".zip"):
+                path_with_ext = path + ".zip"
+            else:
+                path_with_ext = path
+
+            if not os.path.exists(path_with_ext):
+                # Checkpoint doesn't exist yet, return None
+                return None
+
+            try:
+                loaded = MaskablePPO.load(self.self_play_checkpoint_path)
+                # Freeze it
+                loaded.set_training_mode(False)
+                for param in loaded.policy.parameters():
+                    param.requires_grad = False
+                return loaded
+            except Exception:
+                # Loading failed, return None
+                return None
+
+        # Option 3: No policy available - return None (will use random actions)
+        return None
+
     def _sample_opponent_policy(self) -> PolicySlot:
         """Sample an opponent policy from the pool.
 
         Returns:
             PolicySlot with loaded opponent policy.
         """
-        # Self-play: use training policy
+        # Self-play: use frozen policy (either from training_policy or checkpoint)
+        # This prevents co-evolution where the opponent's behavior changes
+        # as the training policy updates mid-episode
         if self.opponent_pool is None or np.random.random() < self.self_play_prob:
+            frozen_policy = self._get_self_play_policy()
             return PolicySlot(
-                policy=self._training_policy,
-                checkpoint_id="__current__",
+                policy=frozen_policy,
+                checkpoint_id="__current_snapshot__",
                 is_training_policy=False,
             )
 
         # Sample from pool
         if len(self.opponent_pool) == 0:
-            # Pool empty, fall back to self-play
+            # Pool empty, fall back to frozen self-play
+            frozen_policy = self._get_self_play_policy()
             return PolicySlot(
-                policy=self._training_policy,
-                checkpoint_id="__current__",
+                policy=frozen_policy,
+                checkpoint_id="__current_snapshot__",
                 is_training_policy=False,
             )
 
         checkpoint_info = self.opponent_pool.sample_opponent(method=self.sampling_method)
         if checkpoint_info is None:
+            frozen_policy = self._get_self_play_policy()
             return PolicySlot(
-                policy=self._training_policy,
-                checkpoint_id="__current__",
+                policy=frozen_policy,
+                checkpoint_id="__current_snapshot__",
                 is_training_policy=False,
             )
 
-        # Load the checkpoint
+        # Load the checkpoint (already frozen by opponent_pool.load_checkpoint)
         try:
             loaded_policy = self.opponent_pool.load_checkpoint(checkpoint_info)
             return PolicySlot(
@@ -300,10 +398,11 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 is_training_policy=False,
             )
         except Exception:
-            # Loading failed, fall back to self-play
+            # Loading failed, fall back to frozen self-play
+            frozen_policy = self._get_self_play_policy()
             return PolicySlot(
-                policy=self._training_policy,
-                checkpoint_id="__current__",
+                policy=frozen_policy,
+                checkpoint_id="__current_snapshot__",
                 is_training_policy=False,
             )
 

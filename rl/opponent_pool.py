@@ -190,13 +190,18 @@ class OpponentPool:
         return info
 
     def load_checkpoint(self, checkpoint_info: CheckpointInfo) -> "MaskablePPO":
-        """Load a checkpoint from disk.
+        """Load a checkpoint from disk as a frozen policy.
+
+        The loaded checkpoint is explicitly frozen (eval mode, no gradients)
+        to ensure it's only used for inference. This prevents any accidental
+        training of opponent policies and ensures consistent behavior from
+        dropout/batch norm layers.
 
         Args:
             checkpoint_info: The checkpoint to load.
 
         Returns:
-            Loaded MaskablePPO model.
+            Loaded and frozen MaskablePPO model.
         """
         from sb3_contrib import MaskablePPO
 
@@ -205,7 +210,17 @@ class OpponentPool:
         if not path.endswith(".zip"):
             path = path + ".zip"
 
-        return MaskablePPO.load(path)
+        loaded = MaskablePPO.load(path)
+
+        # Explicitly freeze for inference only
+        # This disables dropout, batch norm updates, etc.
+        loaded.set_training_mode(False)
+
+        # Disable gradients on all parameters to prevent any accidental training
+        for param in loaded.policy.parameters():
+            param.requires_grad = False
+
+        return loaded
 
     def sample_opponent(
         self,

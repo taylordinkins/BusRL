@@ -116,7 +116,15 @@ def train(args):
             print(f"  Elo range: {opponent_pool.best_elo():.1f} - {opponent_pool.best_elo() - opponent_pool.elo_spread():.1f}")
 
     # Environment creation function
-    def make_env(env_id: str, is_eval: bool = False):
+    def make_env(env_id: str, rank: int, is_eval: bool = False, self_play_checkpoint: str = None):
+        """Create environment factory for vectorized envs.
+
+        Args:
+            env_id: Environment identifier.
+            rank: Index of this environment (for seeding).
+            is_eval: Whether this is an evaluation environment.
+            self_play_checkpoint: Path to checkpoint for self-play opponents (SubprocVecEnv).
+        """
         def _init():
             env = BusEnv(num_players=args.num_players)
 
@@ -129,6 +137,8 @@ def train(args):
                     self_play_prob=args.self_play_prob,
                     sampling_method=args.sampling_method,
                     elo_tracker=elo_tracker,
+                    randomize_training_slot=args.randomize_training_slot,
+                    self_play_checkpoint_path=self_play_checkpoint,
                 )
             else:
                 env = BusEnvSelfPlayWrapper(env)
@@ -136,26 +146,51 @@ def train(args):
             # Monitor should be the outermost wrapper for training stats
             env = Monitor(env)
 
+            # Seed action/observation spaces for diversity
+            import time
+            base_seed = int(time.time()) % 100000
+            env.action_space.seed(base_seed + rank)
+            env.observation_space.seed(base_seed + rank)
+
             return env
         return _init
 
+    # Set up self-play checkpoint path for SubprocVecEnv
+    # This checkpoint will be updated by OpponentPoolCallback so workers
+    # can load recent weights when self_play_prob triggers
+    self_play_checkpoint_path = None
+    if args.multi_policy and args.self_play_prob > 0:
+        if args.initial_checkpoint:
+            # Use provided initial checkpoint as starting point
+            self_play_checkpoint_path = args.initial_checkpoint
+        else:
+            # Create a dedicated path that callback will update
+            self_play_checkpoint_path = os.path.join(log_dir, "self_play_checkpoint")
+
+    # SubprocVecEnv always works with multi-policy now:
+    # - self_play_prob == 0: only pool checkpoints (loaded in subprocess)
+    # - self_play_prob > 0: self_play_checkpoint_path is updated by callback
+
     # Wrap for SB3
-    env_factories = [make_env(f"train_{i}", is_eval=False) for i in range(args.n_envs)]
+    env_factories = [
+        make_env(f"train_{i}", rank=i, is_eval=False, self_play_checkpoint=self_play_checkpoint_path)
+        for i in range(args.n_envs)
+    ]
 
     # Use SubprocVecEnv for better performance with multiple envs
-    # NOTE: Multi-policy mode requires DummyVecEnv because it needs to share
-    # the training_policy object across environments (not possible with multiprocessing)
-    if args.multi_policy:
-        env = DummyVecEnv(env_factories)
-        if args.n_envs > 1:
-            print(f"Note: Using DummyVecEnv instead of SubprocVecEnv for multi-policy mode")
-    elif args.n_envs > 1:
+    if args.n_envs > 1:
         env = SubprocVecEnv(env_factories)
+        vec_env_class = SubprocVecEnv
+        if args.multi_policy:
+            print(f"Using SubprocVecEnv with multi-policy mode ({args.n_envs} parallel envs)")
+            if args.self_play_prob > 0:
+                print(f"  Self-play checkpoint: {self_play_checkpoint_path}")
     else:
         env = DummyVecEnv(env_factories)
+        vec_env_class = DummyVecEnv
 
     # Evaluation environment (always uses self-play wrapper for consistent eval)
-    eval_env = DummyVecEnv([make_env("eval", is_eval=True)])
+    eval_env = DummyVecEnv([make_env("eval", rank=0, is_eval=True)])
 
     # Callbacks
     callbacks = []
@@ -192,10 +227,11 @@ def train(args):
 
     # Opponent pool callbacks
     if opponent_pool is not None:
-        # Checkpoint saving callback
+        # Checkpoint saving callback (also updates self-play checkpoint for SubprocVecEnv)
         pool_callback = OpponentPoolCallback(
             opponent_pool=opponent_pool,
             save_interval=args.pool_save_interval,
+            self_play_checkpoint_path=self_play_checkpoint_path,
             verbose=1,
         )
         callbacks.append(pool_callback)
@@ -240,13 +276,13 @@ def train(args):
         device=args.device,
     )
 
-    # Set training policy reference for multi-policy environments
-    if args.multi_policy and opponent_pool is not None:
+    # Set training policy reference for multi-policy environments (DummyVecEnv only)
+    # For SubprocVecEnv, environments use self_play_checkpoint_path or pool checkpoints
+    if args.multi_policy and opponent_pool is not None and vec_env_class == DummyVecEnv:
         # Access the wrapped environments and set training policy
-        # Note: This only works with DummyVecEnv (see env creation logic above)
         if not hasattr(env, 'envs'):
             raise RuntimeError(
-                "Multi-policy mode requires DummyVecEnv, but current env doesn't have .envs attribute. "
+                "Multi-policy mode with DummyVecEnv should have .envs attribute. "
                 "This should not happen - check environment creation logic."
             )
 
@@ -361,6 +397,10 @@ if __name__ == "__main__":
     parser.add_argument("--sampling-method", type=str, default="pfsp",
                         choices=["uniform", "latest", "pfsp", "elo_weighted"],
                         help="Method for sampling opponents from pool")
+    parser.add_argument("--randomize-training-slot", action="store_true",
+                        help="Randomize which player position is trained each episode (learn to play from any seat)")
+    parser.add_argument("--initial-checkpoint", type=str, default=None,
+                        help="Path to initial checkpoint for self-play opponents (required for SubprocVecEnv with self_play_prob > 0)")
 
     # Pool evaluation args
     parser.add_argument("--pool-eval-interval", type=int, default=100_000,

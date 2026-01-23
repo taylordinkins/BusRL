@@ -30,7 +30,7 @@ class OpponentPoolCallback(BaseCallback):
     This callback:
     - Saves checkpoints to the opponent pool at regular intervals
     - Logs pool statistics to TensorBoard
-    - Can be extended for PFSP matchmaking in the future
+    - Optionally maintains a "self-play checkpoint" for SubprocVecEnv workers
 
     Example:
         >>> pool = OpponentPool(save_dir="checkpoints")
@@ -42,6 +42,7 @@ class OpponentPoolCallback(BaseCallback):
         self,
         opponent_pool: "OpponentPool",
         save_interval: int = 50_000,
+        self_play_checkpoint_path: Optional[str] = None,
         verbose: int = 0,
     ):
         """Initialize the callback.
@@ -49,11 +50,15 @@ class OpponentPoolCallback(BaseCallback):
         Args:
             opponent_pool: The opponent pool to manage.
             save_interval: Training steps between checkpoint saves.
+            self_play_checkpoint_path: If provided, also save a "current policy" checkpoint
+                at this path for SubprocVecEnv workers to load when self_play_prob triggers.
+                This enables SubprocVecEnv to use recent policy weights for self-play.
             verbose: Verbosity level (0 = no output, 1 = info).
         """
         super().__init__(verbose)
         self.opponent_pool = opponent_pool
         self.save_interval = save_interval
+        self.self_play_checkpoint_path = self_play_checkpoint_path
         self._last_save_step = 0
 
     def _on_step(self) -> bool:
@@ -75,6 +80,10 @@ class OpponentPoolCallback(BaseCallback):
         # Save initial checkpoint
         if len(self.opponent_pool) == 0:
             self._save_checkpoint(is_initial=True)
+
+        # Save initial self-play checkpoint for SubprocVecEnv workers
+        if self.self_play_checkpoint_path is not None:
+            self._save_self_play_checkpoint()
 
         if self.verbose > 0:
             print(f"OpponentPoolCallback: Starting with {len(self.opponent_pool)} checkpoints in pool")
@@ -105,11 +114,31 @@ class OpponentPoolCallback(BaseCallback):
             prefix = "Initial" if is_initial else ("Final" if is_final else "Periodic")
             print(f"OpponentPoolCallback: {prefix} checkpoint saved: {info.checkpoint_id}")
 
+        # Also update self-play checkpoint for SubprocVecEnv workers
+        if self.self_play_checkpoint_path is not None:
+            self._save_self_play_checkpoint()
+
         # Log to TensorBoard if available
         if self.logger is not None:
             self.logger.record("opponent_pool/size", len(self.opponent_pool))
             self.logger.record("opponent_pool/best_elo", self.opponent_pool.best_elo())
             self.logger.record("opponent_pool/elo_spread", self.opponent_pool.elo_spread())
+
+    def _save_self_play_checkpoint(self) -> None:
+        """Save current policy to self-play checkpoint path.
+
+        This allows SubprocVecEnv workers to load recent weights when
+        self_play_prob triggers. Workers will pick up the new checkpoint
+        at the start of their next episode.
+        """
+        if self.self_play_checkpoint_path is None:
+            return
+
+        # Save model (overwrites previous)
+        self.model.save(self.self_play_checkpoint_path)
+
+        if self.verbose > 0:
+            print(f"OpponentPoolCallback: Self-play checkpoint updated at step {self.num_timesteps}")
 
 
 class OpponentPoolEvalCallback(BaseCallback):
