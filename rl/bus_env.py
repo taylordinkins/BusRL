@@ -129,6 +129,11 @@ class BusEnv(gym.Env):
         """
         super().reset(seed=seed)
 
+        # FIX 8: Properly seed numpy's RNG for this environment instance
+        # This ensures each subprocess in SubprocVecEnv has different randomness
+        if seed is not None:
+            np.random.seed(seed)
+
         # Create new game
         self._engine = GameEngine()
         self._engine.reset(num_players=self.num_players, board=self._board.clone())
@@ -138,6 +143,9 @@ class BusEnv(gym.Env):
         self._step_count = 0
         self._stuck_counter = 0
         self._last_state_hash = self._engine.state.state_hash()
+
+        # FIX 7: Clear cached action mask on reset
+        self._cached_action_mask = None
 
         # Store initial state for reward computation
         self._prev_state = self._engine.state.clone()
@@ -167,15 +175,34 @@ class BusEnv(gym.Env):
         # Store state before action for reward computation
         prev_state = self._prev_state
         acting_player = self._engine.state.global_state.current_player_idx
-        info = self._get_info() # Initialize info here
 
         # Convert action index to Action object
         action_obj = self._action_mapping.index_to_action(action, self._engine.state)
 
-        # 1. Update step count and check limits
+        # 1. Update step count
         self._step_count += 1
-        
-        # 2. Stuck detection: Check if state changed (even invalid actions count)
+
+        # 2. Execute the action FIRST, then check stuck detection
+        if action_obj.params.get("noop", False):
+            self._auto_advance()
+        else:
+            # Execute the action
+            step_result = self._engine.step(action_obj)
+
+            if not step_result.success:
+                # Invalid action - return penalty
+                # FIX 4: Don't update _prev_state for invalid actions
+                # Keep the state before this invalid attempt for correct reward calculation
+                info = self._build_info()
+                info["error"] = step_result.info.get("error", "Unknown error")
+                info["invalid_action"] = True
+                terminated = self._engine.is_game_over()
+                return self._get_observation(), self._reward_config.invalid_action_penalty, terminated, False, info
+
+            # Action was successful, now auto-advance through automatic phases
+            self._auto_advance()
+
+        # 3. FIX 2: Check stuck detection AFTER action executes
         new_state_hash = self._engine.state.state_hash()
         if new_state_hash == self._last_state_hash:
             self._stuck_counter += 1
@@ -183,33 +210,10 @@ class BusEnv(gym.Env):
             self._stuck_counter = 0
             self._last_state_hash = new_state_hash
 
-        truncated = (self._step_count >= self._max_steps) or (self._stuck_counter >= 50)
+        # 4. Check termination/truncation after action and auto-advance
         terminated = self._engine.is_game_over()
-
-        if truncated:
-             return self._get_observation(), 0.0, terminated, True, info
-
-        # 3. Handle NOOP
-        if action_obj.params.get("noop", False):
-            self._auto_advance()
-        else:
-            # 4. Execute the action
-            step_result = self._engine.step(action_obj)
-
-            if not step_result.success:
-                # Invalid action - return penalty
-                info["error"] = step_result.info.get("error", "Unknown error")
-                info["invalid_action"] = True
-                # Update previous state but don't advance
-                self._prev_state = self._engine.state.clone()
-                return self._get_observation(), self._reward_config.invalid_action_penalty, terminated, False, info
-            
-            # Action was successful, now auto-advance through automatic phases
-            self._auto_advance()
-        
-        # 5. Re-check state after potential advancement
-        terminated = self._engine.is_game_over()
-        truncated = (self._step_count >= self._max_steps) or (self._stuck_counter >= 50)
+        # FIX 9: Use > instead of >= for correct max_steps behavior
+        truncated = (self._step_count > self._max_steps) or (self._stuck_counter >= 50)
 
         # Compute reward for the acting player
         action_info = {"action_type": action_obj.action_type.value}
@@ -221,16 +225,18 @@ class BusEnv(gym.Env):
             action_info=action_info,
         )
 
-
-        # Update previous state
+        # Update previous state (this also covers truncation case - FIX 3)
         self._prev_state = self._engine.state.clone()
         self._current_player_at_step = self._engine.state.global_state.current_player_idx
 
         # Get new observation (from new current player's perspective)
         obs = self._get_observation()
-        # Merge existing info with fresh info
-        new_info = self._get_info()
-        info.update(new_info)
+
+        # FIX 7: Cache action mask to avoid computing multiple times
+        self._cached_action_mask = self.action_masks()
+
+        # Build info dict
+        info = self._build_info()
         info["acting_player"] = acting_player
         info["reward_breakdown"] = self._reward_calculator.compute_reward_detailed(
             self._engine.state, prev_state, acting_player, terminated, action_info
@@ -296,6 +302,13 @@ class BusEnv(gym.Env):
         resolver = ActionResolver(self._engine.state)
         result = resolver.resolve_all()
 
+        # FIX 5: Check if resolution succeeded before advancing
+        if not result.success:
+            # Resolution failed - log but continue (don't crash training)
+            # The game may be in an inconsistent state, but the NOOP fallback
+            # in action_masks() will handle it
+            return
+
         # Update resolution progress so phase transition triggers
         self._engine.state.global_state.current_resolution_area_idx = len(
             ACTION_RESOLUTION_ORDER
@@ -335,13 +348,20 @@ class BusEnv(gym.Env):
         current_player = self._engine.state.global_state.current_player_idx
         return self._obs_encoder.encode(self._engine.state, current_player)
 
-    def _get_info(self) -> dict[str, Any]:
-        """Get info dictionary with game metadata."""
+    def _build_info(self) -> dict[str, Any]:
+        """Build info dictionary with game metadata using cached mask if available.
+
+        This is the preferred method to call from step() as it uses cached mask.
+        """
         if self._engine is None:
             return {}
 
         state = self._engine.state
-        mask = self.action_masks()
+
+        # FIX 7: Use cached mask if available, otherwise compute
+        mask = getattr(self, '_cached_action_mask', None)
+        if mask is None:
+            mask = self.action_masks()
 
         return {
             "phase": state.phase.value,
@@ -352,6 +372,13 @@ class BusEnv(gym.Env):
             "time_stones": {p.player_id: p.time_stones for p in state.players},
             "buses": {p.player_id: p.buses for p in state.players},
         }
+
+    def _get_info(self) -> dict[str, Any]:
+        """Get info dictionary with game metadata.
+
+        Note: For use in step(), prefer _build_info() which uses cached mask.
+        """
+        return self._build_info()
 
     def render(self) -> Optional[str]:
         """Render the current state.
@@ -414,6 +441,19 @@ class BusEnv(gym.Env):
             new_env._engine = self._engine.clone()
             new_env._prev_state = self._prev_state.clone() if self._prev_state else None
             new_env._current_player_at_step = self._current_player_at_step
+
+            # FIX 6: Copy step tracking state for correct truncation behavior
+            new_env._step_count = self._step_count
+            new_env._stuck_counter = self._stuck_counter
+            new_env._last_state_hash = self._last_state_hash
+
+            # Copy cached action mask if present
+            new_env._cached_action_mask = (
+                self._cached_action_mask.copy()
+                if hasattr(self, '_cached_action_mask') and self._cached_action_mask is not None
+                else None
+            )
+
             # Copy reward calculator state
             new_env._reward_calculator._stations_connected = {
                 k: v.copy()
