@@ -276,6 +276,9 @@ class MultiPolicyBusEnv(gym.Wrapper):
     def _assign_policies(self) -> None:
         """Assign policies to all player slots for this episode."""
         self._policy_slots = []
+        
+        # DEBUG: Log policy assignment
+        # print(f"[MultiPolicyBusEnv] Assigning policies for episode (Training Slot: {self.training_slot})", flush=True)
 
         for slot in range(self._num_players):
             if slot == self.training_slot:
@@ -329,7 +332,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
             policy.save(tmp_path)
             
             # Load it back (creates independent copy)
-            frozen = MaskablePPO.load(tmp_path)
+            frozen = MaskablePPO.load(tmp_path, device="cpu")
             
             # Put in evaluation mode and disable gradients
             frozen.policy.set_training_mode(False)
@@ -377,7 +380,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 return None
 
             try:
-                loaded = MaskablePPO.load(self.self_play_checkpoint_path)
+                loaded = MaskablePPO.load(self.self_play_checkpoint_path, device="cpu")
                 # Freeze it
                 loaded.policy.set_training_mode(False)
                 for param in loaded.policy.parameters():

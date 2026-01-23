@@ -355,6 +355,14 @@ def train(args):
                     break
                 current = current.env
 
+    # For SubprocVecEnv, we must ensure the self-play checkpoint exists before training starts
+    # because subprocesses might try to load it immediately upon first reset
+    if args.multi_policy and args.self_play_prob > 0 and use_subproc and self_play_checkpoint_path:
+        print(f"Saving initial self-play checkpoint to {self_play_checkpoint_path}...")
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self_play_checkpoint_path), exist_ok=True)
+        model.save(self_play_checkpoint_path)
+
     print(f"\nStarting training for {args.total_timesteps} steps...")
     print(f"Logs and models will be saved to: {log_dir}")
     print(f"Number of parallel environments: {args.n_envs}")

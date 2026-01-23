@@ -210,7 +210,7 @@ class OpponentPool:
         if not path.endswith(".zip"):
             path = path + ".zip"
 
-        loaded = MaskablePPO.load(path)
+        loaded = MaskablePPO.load(path, device="cpu")
 
         # Explicitly freeze for inference only
         # This disables dropout, batch norm updates, etc.
