@@ -60,6 +60,8 @@ class PolicySlot:
         """
         if self.policy is None:
             # Random valid action fallback
+            import warnings
+            warnings.warn(f"PolicySlot {self.checkpoint_id} has None policy, using random actions")
             valid_actions = np.where(action_mask)[0]
             if len(valid_actions) == 0:
                 return 0
@@ -278,11 +280,22 @@ class MultiPolicyBusEnv(gym.Wrapper):
         for slot in range(self._num_players):
             if slot == self.training_slot:
                 # Training slot uses current training policy
-                self._policy_slots.append(PolicySlot(
-                    policy=self._training_policy,
-                    checkpoint_id="__current__",
-                    is_training_policy=True,
-                ))
+                # In SubprocVecEnv, _training_policy is None, so we use self-play checkpoint
+                if self._training_policy is None:
+                    # Subprocess mode: load from self_play_checkpoint_path
+                    frozen_policy = self._get_self_play_policy()
+                    self._policy_slots.append(PolicySlot(
+                        policy=frozen_policy,
+                        checkpoint_id="__training_subprocess__",
+                        is_training_policy=True,
+                    ))
+                else:
+                    # Main process mode: use live training policy reference
+                    self._policy_slots.append(PolicySlot(
+                        policy=self._training_policy,
+                        checkpoint_id="__current__",
+                        is_training_policy=True,
+                    ))
             else:
                 # Sample opponent for this slot
                 policy_slot = self._sample_opponent_policy()
@@ -301,19 +314,36 @@ class MultiPolicyBusEnv(gym.Wrapper):
         Returns:
             A frozen copy of the policy with gradients disabled.
         """
-        import copy
+        # Using deepcopy on PyTorch models can cause issues in multiprocessing
+        # Instead, save to a temporary file and reload
+        import tempfile
+        import os
+        from sb3_contrib import MaskablePPO
 
-        # Deep copy the policy to create independent weights
-        frozen = copy.deepcopy(policy)
+        # Create a temporary file for the checkpoint
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.zip') as tmp:
+            tmp_path = tmp.name
 
-        # Put in evaluation mode (disables dropout, batch norm updates, etc.)
-        frozen.policy.set_training_mode(False)
-
-        # Disable gradients on all parameters
-        for param in frozen.policy.parameters():
-            param.requires_grad = False
-
-        return frozen
+        try:
+            # Save the policy
+            policy.save(tmp_path)
+            
+            # Load it back (creates independent copy)
+            frozen = MaskablePPO.load(tmp_path)
+            
+            # Put in evaluation mode and disable gradients
+            frozen.policy.set_training_mode(False)
+            for param in frozen.policy.parameters():
+                param.requires_grad = False
+            
+            return frozen
+        finally:
+            # Clean up temporary file
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except:
+                pass
 
     def _get_self_play_policy(self) -> "MaskablePPO":
         """Get a frozen policy for self-play opponents.
