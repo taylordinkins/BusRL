@@ -104,7 +104,6 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self_play_prob: float = 0.2,
         sampling_method: str = "pfsp",
         elo_tracker: Optional["EloTracker"] = None,
-        training_policy_path: Optional[str] = None,
     ):
         """Initialize the multi-policy wrapper.
 
@@ -115,7 +114,6 @@ class MultiPolicyBusEnv(gym.Wrapper):
             self_play_prob: Probability of using current policy as opponent.
             sampling_method: How to sample from pool ("uniform", "pfsp", "elo_weighted").
             elo_tracker: Optional Elo tracker for rating updates after games.
-            training_policy_path: Path to the live updated policy file.
         """
         super().__init__(env)
 
@@ -124,40 +122,29 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self.self_play_prob = self_play_prob
         self.sampling_method = sampling_method
         self.elo_tracker = elo_tracker
-        self.training_policy_path = training_policy_path
 
         # Policy assignments for each player slot
         self._policy_slots: list[PolicySlot] = []
         self._num_players = getattr(env, "num_players", 4)
 
-        # Cached training policy for opponents
-        self._cached_policy: Optional["MaskablePPO"] = None
-        self._last_loaded_mtime: float = 0.0
+        # Cached training policy reference (set externally)
+        self._training_policy: Optional["MaskablePPO"] = None
 
         # Track game outcomes for Elo updates
         self._current_episode_checkpoints: list[str] = []
 
-    def _load_latest_policy(self) -> Optional["MaskablePPO"]:
-        """Load the latest training policy if updated on disk."""
-        if not self.training_policy_path or not os.path.exists(self.training_policy_path):
-            return self._cached_policy
-            
-        try:
-            mtime = os.path.getmtime(self.training_policy_path)
-            if mtime > self._last_loaded_mtime:
-                from sb3_contrib import MaskablePPO
-                # Use custom_objects map to load on CPU to avoid CUDA errors in workers
-                self._cached_policy = MaskablePPO.load(
-                    self.training_policy_path, 
-                    device="cpu",
-                    custom_objects={"n_envs": 1} # small hack to avoid mismatch errors if config differs
-                )
-                self._last_loaded_mtime = mtime
-        except Exception as e:
-            # If load fails (e.g. partial write), just use old cached one
-            pass
-            
-        return self._cached_policy
+    @property
+    def training_policy(self) -> Optional["MaskablePPO"]:
+        """Get the current training policy."""
+        return self._training_policy
+
+    @training_policy.setter
+    def training_policy(self, policy: "MaskablePPO") -> None:
+        """Set the current training policy."""
+        self._training_policy = policy
+        # Also update pool's current policy reference
+        if self.opponent_pool is not None:
+            self.opponent_pool.current_policy = policy
 
     def reset(
         self,
@@ -262,9 +249,9 @@ class MultiPolicyBusEnv(gym.Wrapper):
 
         for slot in range(self._num_players):
             if slot == self.training_slot:
-                # Training slot acts as itself (no policy needed for step() as action comes from learner)
+                # Training slot uses current training policy
                 self._policy_slots.append(PolicySlot(
-                    policy=None, 
+                    policy=self._training_policy,
                     checkpoint_id="__current__",
                     is_training_policy=True,
                 ))
@@ -281,9 +268,8 @@ class MultiPolicyBusEnv(gym.Wrapper):
         """
         # Self-play: use training policy
         if self.opponent_pool is None or np.random.random() < self.self_play_prob:
-            current_policy = self._load_latest_policy()
             return PolicySlot(
-                policy=current_policy,
+                policy=self._training_policy,
                 checkpoint_id="__current__",
                 is_training_policy=False,
             )
@@ -291,18 +277,16 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # Sample from pool
         if len(self.opponent_pool) == 0:
             # Pool empty, fall back to self-play
-            current_policy = self._load_latest_policy()
             return PolicySlot(
-                policy=current_policy,
+                policy=self._training_policy,
                 checkpoint_id="__current__",
                 is_training_policy=False,
             )
 
         checkpoint_info = self.opponent_pool.sample_opponent(method=self.sampling_method)
         if checkpoint_info is None:
-            current_policy = self._load_latest_policy()
             return PolicySlot(
-                policy=current_policy,
+                policy=self._training_policy,
                 checkpoint_id="__current__",
                 is_training_policy=False,
             )
@@ -317,9 +301,8 @@ class MultiPolicyBusEnv(gym.Wrapper):
             )
         except Exception:
             # Loading failed, fall back to self-play
-            current_policy = self._load_latest_policy()
             return PolicySlot(
-                policy=current_policy,
+                policy=self._training_policy,
                 checkpoint_id="__current__",
                 is_training_policy=False,
             )
