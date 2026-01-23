@@ -375,3 +375,30 @@ class MultiPolicyTrainingCallback(BaseCallback):
             print(f"  Total games: {self._games_played}")
             print(f"  Pool size: {len(self.opponent_pool)}")
             print(f"  Best Elo: {self.opponent_pool.best_elo():.1f}")
+
+
+class SyncPolicyCallback(BaseCallback):
+    """Callback for synchronizing the live policy to disk for parallel workers.
+
+    This bypasses the limitation of SubprocVecEnv not being able to share
+    live model references. Workers will hot-reload this file.
+    """
+
+    def __init__(self, save_path: str, save_interval: int = 2048, verbose: int = 0):
+        super().__init__(verbose)
+        self.save_path = save_path
+        self.save_interval = save_interval
+        self._last_save_step = 0
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_save_step >= self.save_interval:
+            self.model.save(self.save_path)
+            self._last_save_step = self.num_timesteps
+        return True
+    
+    def _on_training_start(self) -> None:
+        # Save immediately so workers finding it on first reset don't crash
+        self.model.save(self.save_path)

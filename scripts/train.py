@@ -37,6 +37,7 @@ from rl.callbacks import (
     OpponentPoolCallback,
     OpponentPoolEvalCallback,
     MultiPolicyTrainingCallback,
+    SyncPolicyCallback,
 )
 
 
@@ -71,6 +72,9 @@ def train(args):
     run_name = f"ppo_bus_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_dir = os.path.join("logs", run_name)
     os.makedirs(log_dir, exist_ok=True)
+    
+    # Path for synchronizing live policy to workers
+    live_policy_path = os.path.join(log_dir, "live_policy.zip")
 
     # Initialize opponent pool and Elo tracker if enabled
     opponent_pool = None
@@ -129,6 +133,7 @@ def train(args):
                     self_play_prob=args.self_play_prob,
                     sampling_method=args.sampling_method,
                     elo_tracker=elo_tracker,
+                    training_policy_path=live_policy_path,
                 )
             else:
                 env = BusEnvSelfPlayWrapper(env)
@@ -145,11 +150,8 @@ def train(args):
     # Use SubprocVecEnv for better performance with multiple envs
     # NOTE: Multi-policy mode requires DummyVecEnv because it needs to share
     # the training_policy object across environments (not possible with multiprocessing)
-    if args.multi_policy:
-        env = DummyVecEnv(env_factories)
-        if args.n_envs > 1:
-            print(f"Note: Using DummyVecEnv instead of SubprocVecEnv for multi-policy mode")
-    elif args.n_envs > 1:
+    # Multi-policy mode now supports SubprocVecEnv via file sync
+    if args.n_envs > 1:
         env = SubprocVecEnv(env_factories)
     else:
         env = DummyVecEnv(env_factories)
@@ -180,7 +182,6 @@ def train(args):
     )
     callbacks.append(eval_callback)
 
-    # Entropy decay callback
     if args.ent_coef_final < args.ent_coef:
         entropy_callback = EntropyDecayCallback(
             initial_ent_coef=args.ent_coef,
@@ -189,6 +190,15 @@ def train(args):
             verbose=1,
         )
         callbacks.append(entropy_callback)
+
+    # Sync policy callback for multi-policy parallel training
+    if args.multi_policy:
+        sync_callback = SyncPolicyCallback(
+            save_path=live_policy_path,
+            save_interval=2048, # Sync every update roughly
+            verbose=0
+        )
+        callbacks.append(sync_callback)
 
     # Opponent pool callbacks
     if opponent_pool is not None:
@@ -241,24 +251,8 @@ def train(args):
     )
 
     # Set training policy reference for multi-policy environments
-    if args.multi_policy and opponent_pool is not None:
-        # Access the wrapped environments and set training policy
-        # Note: This only works with DummyVecEnv (see env creation logic above)
-        if not hasattr(env, 'envs'):
-            raise RuntimeError(
-                "Multi-policy mode requires DummyVecEnv, but current env doesn't have .envs attribute. "
-                "This should not happen - check environment creation logic."
-            )
-
-        for i in range(args.n_envs):
-            wrapped_env = env.envs[i]
-            # Navigate through wrapper stack to find MultiPolicyBusEnv
-            current = wrapped_env
-            while hasattr(current, 'env'):
-                if isinstance(current, MultiPolicyBusEnv):
-                    current.training_policy = model
-                    break
-                current = current.env
+    # NOTE: With file-based sync, we don't need to manually set the policy object anymore!
+    # The workers will load it from disk.
 
     print(f"\nStarting training for {args.total_timesteps} steps...")
     print(f"Logs and models will be saved to: {log_dir}")
