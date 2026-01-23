@@ -214,7 +214,7 @@ class OpponentPool:
 
         # Explicitly freeze for inference only
         # This disables dropout, batch norm updates, etc.
-        loaded.set_training_mode(False)
+        loaded.policy.set_training_mode(False)
 
         # Disable gradients on all parameters to prevent any accidental training
         for param in loaded.policy.parameters():

@@ -300,7 +300,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
         frozen = copy.deepcopy(policy)
 
         # Put in evaluation mode (disables dropout, batch norm updates, etc.)
-        frozen.set_training_mode(False)
+        frozen.policy.set_training_mode(False)
 
         # Disable gradients on all parameters
         for param in frozen.policy.parameters():
@@ -342,7 +342,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
             try:
                 loaded = MaskablePPO.load(self.self_play_checkpoint_path)
                 # Freeze it
-                loaded.set_training_mode(False)
+                loaded.policy.set_training_mode(False)
                 for param in loaded.policy.parameters():
                     param.requires_grad = False
                 return loaded
