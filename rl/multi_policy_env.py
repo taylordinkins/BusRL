@@ -193,6 +193,15 @@ class MultiPolicyBusEnv(gym.Wrapper):
         if self.opponent_pool is not None and self.elo_tracker is None:
             self.opponent_pool.refresh()
 
+            # Invalidate cache entries for checkpoints that are no longer in the pool
+            # This prevents memory leaks from pruned checkpoints
+            valid_checkpoint_ids = {ckpt.checkpoint_id for ckpt in self.opponent_pool.checkpoints}
+            self._policy_cache = {
+                ckpt_id: policy
+                for ckpt_id, policy in self._policy_cache.items()
+                if ckpt_id in valid_checkpoint_ids
+            }
+
         # Randomize training slot if enabled (learn to play from any position)
         if self.randomize_training_slot:
             self.training_slot = np.random.randint(0, self._num_players)
