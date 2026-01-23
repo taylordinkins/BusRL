@@ -315,17 +315,7 @@ class BusEnv(gym.Env):
             return np.zeros(self._action_config.total_actions, dtype=np.bool_)
 
         valid_actions = self._engine.get_valid_actions()
-        mask = self._mask_generator.generate_mask(self._engine.state, valid_actions)
-
-        # Safety check: Ensure at least one action is valid
-        # This prevents rare edge cases where all actions are masked
-        if not np.any(mask):
-            # If truly no valid actions, mark NOOP as valid
-            # This should only happen in edge cases during phase transitions
-            noop_idx = self._action_config.noop_idx
-            mask[noop_idx] = True
-
-        return mask
+        return self._mask_generator.generate_mask(self._engine.state, valid_actions)
 
     def _get_observation(self) -> np.ndarray:
         """Get observation tensor for the current player."""
