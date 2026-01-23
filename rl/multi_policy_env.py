@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from sb3_contrib import MaskablePPO
     from .opponent_pool import OpponentPool, CheckpointInfo
     from .elo_tracker import EloTracker
-import os
 
 
 class PolicySlot:
