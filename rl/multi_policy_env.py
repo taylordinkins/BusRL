@@ -178,6 +178,13 @@ class MultiPolicyBusEnv(gym.Wrapper):
         """
         obs, info = self.env.reset(seed=seed, options=options)
 
+        # For subprocess environments, refresh the opponent pool from disk
+        # to pick up new checkpoints saved by the main training process.
+        # We detect subprocess mode by checking for self_play_checkpoint_path
+        # (only set in SubprocVecEnv mode) or elo_tracker being None.
+        if self.opponent_pool is not None and self.elo_tracker is None:
+            self.opponent_pool.refresh()
+
         # Randomize training slot if enabled (learn to play from any position)
         if self.randomize_training_slot:
             self.training_slot = np.random.randint(0, self._num_players)

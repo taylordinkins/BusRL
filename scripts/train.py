@@ -115,8 +115,20 @@ def train(args):
         if len(opponent_pool) > 0:
             print(f"  Elo range: {opponent_pool.best_elo():.1f} - {opponent_pool.best_elo() - opponent_pool.elo_spread():.1f}")
 
+    # Get pool directory for subprocess environment creation
+    # (subprocesses need to create their own OpponentPool instances)
+    pool_dir = None
+    if opponent_pool is not None:
+        pool_dir = str(opponent_pool.save_dir)
+
     # Environment creation function
-    def make_env(env_id: str, rank: int, is_eval: bool = False, self_play_checkpoint: str = None):
+    def make_env(
+        env_id: str,
+        rank: int,
+        is_eval: bool = False,
+        self_play_checkpoint: str = None,
+        use_subproc: bool = False,
+    ):
         """Create environment factory for vectorized envs.
 
         Args:
@@ -124,22 +136,60 @@ def train(args):
             rank: Index of this environment (for seeding).
             is_eval: Whether this is an evaluation environment.
             self_play_checkpoint: Path to checkpoint for self-play opponents (SubprocVecEnv).
+            use_subproc: If True, create OpponentPool in subprocess (for SubprocVecEnv).
         """
+        # Capture these values for the closure (simple picklable values)
+        _num_players = args.num_players
+        _multi_policy = args.multi_policy
+        _self_play_prob = args.self_play_prob
+        _sampling_method = args.sampling_method
+        _randomize_training_slot = args.randomize_training_slot
+        _pool_dir = pool_dir
+        _pool_size = args.pool_size
+        _pool_save_interval = args.pool_save_interval
+        _prune_strategy = args.prune_strategy
+
         def _init():
-            env = BusEnv(num_players=args.num_players)
+            env = BusEnv(num_players=_num_players)
 
             # For training with multi-policy mode, wrap with MultiPolicyBusEnv
-            if args.multi_policy and opponent_pool is not None and not is_eval:
-                env = MultiPolicyBusEnv(
-                    env,
-                    opponent_pool=opponent_pool,
-                    training_slot=0,
-                    self_play_prob=args.self_play_prob,
-                    sampling_method=args.sampling_method,
-                    elo_tracker=elo_tracker,
-                    randomize_training_slot=args.randomize_training_slot,
-                    self_play_checkpoint_path=self_play_checkpoint,
-                )
+            if _multi_policy and _pool_dir is not None and not is_eval:
+                # For SubprocVecEnv: create a fresh OpponentPool in each subprocess
+                # that loads checkpoints from the shared directory
+                if use_subproc:
+                    from rl.opponent_pool import OpponentPool, PoolConfig
+                    subprocess_pool_config = PoolConfig(
+                        pool_size=_pool_size,
+                        save_interval=_pool_save_interval,
+                        prune_strategy=_prune_strategy,
+                    )
+                    subprocess_pool = OpponentPool(
+                        save_dir=_pool_dir,
+                        config=subprocess_pool_config,
+                        elo_tracker=None,  # Subprocesses don't track Elo
+                    )
+                    env = MultiPolicyBusEnv(
+                        env,
+                        opponent_pool=subprocess_pool,
+                        training_slot=0,
+                        self_play_prob=_self_play_prob,
+                        sampling_method=_sampling_method,
+                        elo_tracker=None,  # Subprocesses don't track Elo
+                        randomize_training_slot=_randomize_training_slot,
+                        self_play_checkpoint_path=self_play_checkpoint,
+                    )
+                else:
+                    # For DummyVecEnv: use the main process's OpponentPool
+                    env = MultiPolicyBusEnv(
+                        env,
+                        opponent_pool=opponent_pool,
+                        training_slot=0,
+                        self_play_prob=_self_play_prob,
+                        sampling_method=_sampling_method,
+                        elo_tracker=elo_tracker,
+                        randomize_training_slot=_randomize_training_slot,
+                        self_play_checkpoint_path=self_play_checkpoint,
+                    )
             else:
                 env = BusEnvSelfPlayWrapper(env)
 
@@ -171,14 +221,23 @@ def train(args):
     # - self_play_prob == 0: only pool checkpoints (loaded in subprocess)
     # - self_play_prob > 0: self_play_checkpoint_path is updated by callback
 
+    # Determine if using SubprocVecEnv (affects how environments are created)
+    use_subproc = args.n_envs > 1
+
     # Wrap for SB3
     env_factories = [
-        make_env(f"train_{i}", rank=i, is_eval=False, self_play_checkpoint=self_play_checkpoint_path)
+        make_env(
+            f"train_{i}",
+            rank=i,
+            is_eval=False,
+            self_play_checkpoint=self_play_checkpoint_path,
+            use_subproc=use_subproc,
+        )
         for i in range(args.n_envs)
     ]
 
     # Use SubprocVecEnv for better performance with multiple envs
-    if args.n_envs > 1:
+    if use_subproc:
         env = SubprocVecEnv(env_factories)
         vec_env_class = SubprocVecEnv
         if args.multi_policy:

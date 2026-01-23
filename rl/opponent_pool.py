@@ -544,3 +544,12 @@ class OpponentPool:
         except Exception:
             # If loading fails, start with empty pool
             self.checkpoints = []
+
+    def refresh(self) -> None:
+        """Refresh pool state from disk.
+
+        Call this to pick up new checkpoints added by other processes.
+        Useful for SubprocVecEnv workers to see checkpoints saved by
+        the main training process.
+        """
+        self._load_pool_state()
