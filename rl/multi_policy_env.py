@@ -140,6 +140,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self._policy_slots: list[PolicySlot] = []
         self._num_players = getattr(env, "num_players", 4)
 
+        # Policy cache to avoid reloading from disk
+        # Key: checkpoint_id, Value: frozen MaskablePPO model
+        self._policy_cache: dict[str, "MaskablePPO"] = {}
+        # Track modification time of self-play checkpoint to know when to reload
+        self._self_play_mtime: float = 0.0
+
         # Cached training policy reference (set externally for DummyVecEnv)
         # For SubprocVecEnv, use self_play_checkpoint_path instead
         self._training_policy: Optional["MaskablePPO"] = None
@@ -363,7 +369,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
             return self._create_frozen_copy(self._training_policy)
 
         # Option 2: Load from checkpoint path (SubprocVecEnv)
-        # Reload each time to pick up updates from OpponentPoolCallback
+        # Reload only if file has changed, otherwise return cached version
         if self.self_play_checkpoint_path is not None:
             from sb3_contrib import MaskablePPO
             import os
@@ -380,12 +386,21 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 return None
 
             try:
-                loaded = MaskablePPO.load(self.self_play_checkpoint_path, device="cpu")
-                # Freeze it
-                loaded.policy.set_training_mode(False)
-                for param in loaded.policy.parameters():
-                    param.requires_grad = False
-                return loaded
+                # Check modification time
+                mtime = os.path.getmtime(path_with_ext)
+                if mtime > self._self_play_mtime:
+                    # File has changed, reload
+                    loaded = MaskablePPO.load(self.self_play_checkpoint_path, device="cpu")
+                    # Freeze it
+                    loaded.policy.set_training_mode(False)
+                    for param in loaded.policy.parameters():
+                        param.requires_grad = False
+                    
+                    # Update cache and mtime
+                    self._self_play_checkpoint_policy = loaded
+                    self._self_play_mtime = mtime
+                
+                return self._self_play_checkpoint_policy
             except Exception:
                 # Loading failed, return None
                 return None
@@ -429,9 +444,21 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 is_training_policy=False,
             )
 
+        # Check cache first
+        if checkpoint_info.checkpoint_id in self._policy_cache:
+            loaded_policy = self._policy_cache[checkpoint_info.checkpoint_id]
+            return PolicySlot(
+                policy=loaded_policy,
+                checkpoint_id=checkpoint_info.checkpoint_id,
+                is_training_policy=False,
+            )
+
         # Load the checkpoint (already frozen by opponent_pool.load_checkpoint)
         try:
             loaded_policy = self.opponent_pool.load_checkpoint(checkpoint_info)
+            # Add to cache
+            self._policy_cache[checkpoint_info.checkpoint_id] = loaded_policy
+            
             return PolicySlot(
                 policy=loaded_policy,
                 checkpoint_id=checkpoint_info.checkpoint_id,
