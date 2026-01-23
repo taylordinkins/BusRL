@@ -116,7 +116,18 @@ def train(args):
             print(f"  Elo range: {opponent_pool.best_elo():.1f} - {opponent_pool.best_elo() - opponent_pool.elo_spread():.1f}")
 
     # Environment creation function
-    def make_env(env_id: str, is_eval: bool = False):
+    def make_env(env_id: str, rank: int, is_eval: bool = False, seed: int = 0):
+        """Create environment with unique seeding for each worker process.
+
+        Args:
+            env_id: Environment identifier for logging.
+            rank: Index of this environment (for unique seeding).
+            is_eval: Whether this is an evaluation environment.
+            seed: Base seed to use (will be offset by rank).
+
+        Returns:
+            Environment factory function.
+        """
         def _init():
             env = BusEnv(num_players=args.num_players)
 
@@ -136,11 +147,23 @@ def train(args):
             # Monitor should be the outermost wrapper for training stats
             env = Monitor(env)
 
+            # Seed with unique value for this worker.
+            # For training envs, use rank-specific seed for diversity.
+            # For eval envs, use fixed seed for reproducibility.
+            env.action_space.seed(seed + rank)
+            env.observation_space.seed(seed + rank)
+
             return env
         return _init
 
     # Wrap for SB3
-    env_factories = [make_env(f"train_{i}", is_eval=False) for i in range(args.n_envs)]
+    # Use a fixed base seed for reproducibility, or generate one
+    import time
+    base_seed = int(time.time()) % 100000  # Use current time as base seed
+    env_factories = [
+        make_env(f"train_{i}", rank=i, is_eval=False, seed=base_seed)
+        for i in range(args.n_envs)
+    ]
 
     # Use SubprocVecEnv for better performance with multiple envs
     # NOTE: Multi-policy mode requires DummyVecEnv because it needs to share
@@ -158,7 +181,8 @@ def train(args):
         vec_env_class = DummyVecEnv
 
     # Evaluation environment (uses same vec env type as training for consistency)
-    eval_env = vec_env_class([make_env("eval", is_eval=True)])
+    # Use fixed seed for eval to ensure reproducible evaluation
+    eval_env = vec_env_class([make_env("eval", rank=0, is_eval=True, seed=42)])
 
     # Callbacks
     callbacks = []
