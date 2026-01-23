@@ -169,10 +169,11 @@ def train(args):
     # NOTE: Multi-policy mode requires DummyVecEnv because it needs to share
     # the training_policy object across environments (not possible with multiprocessing)
     if args.multi_policy:
+        # FORCE DummyVecEnv for multi-policy to ensure safe object sharing
+        # The user reported issues with object propagation in SubprocVecEnv
+        print(f"Note: Multi-policy enabled. Forcing DummyVecEnv for correct policy updates.")
         env = DummyVecEnv(env_factories)
         vec_env_class = DummyVecEnv
-        if args.n_envs > 1:
-            print(f"Note: Using DummyVecEnv instead of SubprocVecEnv for multi-policy mode")
     elif args.n_envs > 1:
         env = SubprocVecEnv(env_factories)
         vec_env_class = SubprocVecEnv
@@ -182,7 +183,8 @@ def train(args):
 
     # Evaluation environment (uses same vec env type as training for consistency)
     # Use fixed seed for eval to ensure reproducible evaluation
-    eval_env = vec_env_class([make_env("eval", rank=0, is_eval=True, seed=42)])
+    # Use DummyVecEnv for eval to avoid overhead
+    eval_env = DummyVecEnv([make_env("eval", rank=0, is_eval=True, seed=42)])
 
     # Callbacks
     callbacks = []
@@ -352,7 +354,7 @@ if __name__ == "__main__":
                         help="PPO clip range")
     parser.add_argument("--ent_coef", type=float, default=0.01,
                         help="Initial entropy coefficient")
-    parser.add_argument("--ent-coef-final", type=float, default=0.01,
+    parser.add_argument("--ent-coef-final", type=float, default=0.005,
                         help="Final entropy coefficient (if less than initial, decay will occur)")
     parser.add_argument("--target_kl", type=float, default=0.03,
                         help="Target KL divergence")

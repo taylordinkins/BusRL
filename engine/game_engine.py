@@ -142,6 +142,7 @@ class GameEngine:
         self,
         num_players: int = 4,
         board: Optional[BoardGraph] = None,
+        seed: Optional[int] = None,
     ) -> GameState:
         """Initialize a new game.
 
@@ -157,6 +158,16 @@ class GameEngine:
 
         # Create initial state
         self._state = GameState.create_initial_state(self._board, num_players)
+        
+        # Apply seeding for diversity if provided
+        if seed is not None:
+            import random
+            rng = random.Random(seed)
+            # Randomize starting player for training diversity
+            start_player = rng.randint(0, num_players - 1)
+            self._state.set_starting_player(start_player)
+            # Also set current player to starting player (it might be redundant but safe)
+            self._state.global_state.current_player_idx = start_player
 
         # Initialize phase machine
         self._phase_machine = PhaseMachine(initial_phase=Phase.SETUP_BUILDINGS)
