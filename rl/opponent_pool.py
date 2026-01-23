@@ -416,6 +416,14 @@ class OpponentPool:
         elos = [c.elo for c in self.checkpoints]
         return max(elos) - min(elos)
 
+    def refresh(self) -> None:
+        """Refresh pool state from disk.
+        
+        This is used by subprocess environments to pick up new checkpoints
+        saved by the main training process. Reloads the pool_state.json file.
+        """
+        self._load_pool_state()
+
     def __len__(self) -> int:
         """Number of checkpoints in the pool."""
         return len(self.checkpoints)
