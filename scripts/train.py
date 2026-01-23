@@ -150,6 +150,11 @@ def train(args):
         _prune_strategy = args.prune_strategy
 
         def _init():
+            # Optimize multiprocessing: prevent CPU oversubscription
+            if use_subproc:
+                import torch
+                torch.set_num_threads(1)
+
             env = BusEnv(num_players=_num_players)
 
             # For training with multi-policy mode, wrap with MultiPolicyBusEnv
