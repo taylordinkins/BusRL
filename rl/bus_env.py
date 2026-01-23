@@ -191,17 +191,10 @@ class BusEnv(gym.Env):
 
             if not step_result.success:
                 # Invalid action - return penalty
-                # FIX 4: Don't update _prev_state for invalid actions
-                # Keep the state before this invalid attempt for correct reward calculation
-
-                # Still need to update hash to avoid stuck counter issues
-                # (invalid actions don't change state, but we want to record that we checked)
-                new_state_hash = self._engine.state.state_hash()
-                if new_state_hash == self._last_state_hash:
-                    self._stuck_counter += 1
-                else:
-                    self._stuck_counter = 0
-                    self._last_state_hash = new_state_hash
+                # Even though action failed, update _prev_state to current state
+                # (which should be unchanged from before). This keeps reward calculation
+                # consistent and prevents _prev_state from becoming stale.
+                self._prev_state = self._engine.state.clone()
 
                 info = self._build_info()
                 info["error"] = step_result.info.get("error", "Unknown error")
