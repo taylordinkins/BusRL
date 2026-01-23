@@ -129,10 +129,10 @@ class BusEnv(gym.Env):
         """
         super().reset(seed=seed)
 
-        # Note: RNG seeding for SubprocVecEnv is handled by Gymnasium's seeding
-        # mechanism via super().reset(seed=seed). Additional numpy.random.seed()
-        # calls can cause all subprocesses to have synchronized RNG states,
-        # leading to identical episodes across all environments.
+        # FIX 8: Properly seed numpy's RNG for this environment instance
+        # This ensures each subprocess in SubprocVecEnv has different randomness
+        if seed is not None:
+            np.random.seed(seed)
 
         # Create new game
         self._engine = GameEngine()
@@ -193,16 +193,6 @@ class BusEnv(gym.Env):
                 # Invalid action - return penalty
                 # FIX 4: Don't update _prev_state for invalid actions
                 # Keep the state before this invalid attempt for correct reward calculation
-
-                # Still need to update hash to avoid stuck counter issues
-                # (invalid actions don't change state, but we want to record that we checked)
-                new_state_hash = self._engine.state.state_hash()
-                if new_state_hash == self._last_state_hash:
-                    self._stuck_counter += 1
-                else:
-                    self._stuck_counter = 0
-                    self._last_state_hash = new_state_hash
-
                 info = self._build_info()
                 info["error"] = step_result.info.get("error", "Unknown error")
                 info["invalid_action"] = True
