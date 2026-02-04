@@ -276,17 +276,22 @@ class RewardConfig:
 
     # Delivery rewards
     delivery_reward: float = 1.0
-    stolen_passenger_bonus: float = 0.1
-    exclusive_delivery_bonus: float = 0.01
+    stolen_passenger_bonus: float = 0.0
+    exclusive_delivery_bonus: float = 0.0
 
     # Network building rewards
-    station_connection_reward: float = 0.1
+    station_connection_reward: float = 0.0
 
     # Penalties
-    time_stone_penalty: float = -0.01
+    time_stone_penalty: float = 0.0
     invalid_action_penalty: float = -1.0
 
     # Terminal rewards use point differential (no config needed)
+
+    # Add a "Won Game Reward"
+    won_game_bonus = 3.0
+    second_place_bonus = 1.0
+    draw_bonus = 1.5
 
 
 # Default configuration instances

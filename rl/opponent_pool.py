@@ -257,9 +257,16 @@ class OpponentPool:
             return random.choices(candidates, weights=probs, k=1)[0]
 
         elif method == "pfsp":
-            # Prioritized Fictitious Self-Play: weight by uncertainty
-            # Win rates near 50% get highest weight
-            weights = [self._pfsp_weight(c.win_rate_vs_current) for c in candidates]
+            # Prioritized Fictitious Self-Play: weight by uncertainty.
+            # Use Elo-derived expected win probability when available — this
+            # updates implicitly for all opponents whenever __current__'s Elo
+            # changes, avoiding staleness of per-opponent win_rate fields.
+            if self._elo_tracker is not None:
+                weights = [self._pfsp_weight(
+                    self._elo_tracker.expected_win_probability("__current__", c.checkpoint_id)
+                ) for c in candidates]
+            else:
+                weights = [self._pfsp_weight(c.win_rate_vs_current) for c in candidates]
             total = sum(weights)
             if total == 0:
                 return random.choice(candidates)
@@ -431,6 +438,94 @@ class OpponentPool:
     def __iter__(self):
         """Iterate over checkpoints."""
         return iter(self.checkpoints)
+
+    def prime_from_pool(self, source_dir: str, n_top: int = 3, n_random: int = 2) -> int:
+        """Prime this pool by copying selected checkpoints from an existing pool.
+
+        Selects the top-N checkpoints by Elo and a random sample from the
+        remainder (no duplicates), copies their model files into this pool's
+        save directory, and registers them with preserved Elo ratings.
+
+        win_rate_vs_current and games_played are intentionally reset — they
+        carry no meaning in the context of a new training run.
+
+        Args:
+            source_dir: Path to the source opponent pool directory containing
+                pool_state.json and checkpoint files.
+            n_top: Number of highest-Elo checkpoints to copy.
+            n_random: Number of additional randomly sampled checkpoints to copy.
+
+        Returns:
+            Number of checkpoints successfully copied.
+        """
+        source_dir = Path(source_dir)
+        state_path = source_dir / "pool_state.json"
+        if not state_path.exists():
+            return 0
+
+        try:
+            with open(state_path, "r") as f:
+                state = json.load(f)
+            source_checkpoints = [
+                CheckpointInfo.from_dict(c) for c in state.get("checkpoints", [])
+            ]
+        except Exception:
+            return 0
+
+        # Validate source checkpoint files exist
+        valid_source = []
+        for ckpt in source_checkpoints:
+            path = Path(ckpt.path)
+            if path.exists() or path.with_suffix("").exists():
+                valid_source.append(ckpt)
+
+        if not valid_source:
+            return 0
+
+        # Top-N by Elo
+        sorted_by_elo = sorted(valid_source, key=lambda c: c.elo, reverse=True)
+        top = sorted_by_elo[:n_top]
+        top_ids = {c.checkpoint_id for c in top}
+
+        # Random sample from remainder (no duplicates with top)
+        remainder = [c for c in valid_source if c.checkpoint_id not in top_ids]
+        random_picks = random.sample(remainder, min(n_random, len(remainder)))
+
+        selected = top + random_picks
+
+        # Copy each checkpoint into this pool
+        copied = 0
+        for ckpt in selected:
+            src_path = Path(ckpt.path)
+            if not src_path.exists():
+                src_path = src_path.with_suffix("")
+                if not src_path.exists():
+                    continue
+
+            dst_path = self.save_dir / src_path.name
+            shutil.copy2(str(src_path), str(dst_path))
+
+            new_info = CheckpointInfo(
+                checkpoint_id=ckpt.checkpoint_id,
+                path=str(dst_path),
+                step=ckpt.step,
+                elo=ckpt.elo,
+                created_at=ckpt.created_at,
+                win_rate_vs_current=0.5,
+                games_played=0,
+                metadata=ckpt.metadata,
+            )
+            self.checkpoints.append(new_info)
+
+            if self._elo_tracker is not None:
+                self._elo_tracker.register_checkpoint(new_info.checkpoint_id, new_info.elo)
+
+            copied += 1
+
+        if copied > 0:
+            self._save_pool_state()
+
+        return copied
 
     # -------------------------------------------------------------------------
     # Private methods

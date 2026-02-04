@@ -316,45 +316,72 @@ class RewardCalculator:
         return 0.0
 
     def _compute_terminal_reward(
-        self,
-        state: "GameState",
-        player_id: int,
-    ) -> float:
-        """Compute terminal reward based on point differential.
+            self,
+            state: "GameState",
+            player_id: int,
+        ) -> float:
+        """Compute terminal reward based on point differential with draw handling.
 
-        Winner gets: (winner_score - second_place_score)
-        Others get: (their_score - winner_score) [negative]
+        Rewards:
+        • Win: (first - second) + won_game_bonus
+        • Draw (tie for first): draw_bonus
+        • Second place: (score - first) + second_place_bonus
+        • Others: (score - first)
 
-        Args:
-            state: Final game state.
-            player_id: Player to compute reward for.
-
-        Returns:
-            Terminal reward (positive for winner, negative for others).
+        This ensures:
+        win > draw > second > others
         """
-        # Calculate final scores (score - time_stones)
+
+        # ---- Compute final scores ----
         final_scores = []
         for player in state.players:
             final_score = player.score - player.time_stones
             final_scores.append((final_score, player.player_id))
 
-        # Sort by score descending
+        # Sort descending by score
         final_scores.sort(reverse=True, key=lambda x: x[0])
 
-        first_place_score = final_scores[0][0]
-        first_place_id = final_scores[0][1]
-        second_place_score = final_scores[1][0] if len(final_scores) > 1 else 0
+        # Extract ordered scores
+        scores_only = [s for s, _ in final_scores]
 
-        player_score = next(
-            score for score, pid in final_scores if pid == player_id
-        )
+        first_place_score = scores_only[0]
+        second_place_score = scores_only[1] if len(scores_only) > 1 else first_place_score
 
-        if player_id == first_place_id:
-            # Winner gets difference over second place
-            return float(first_place_score - second_place_score)
-        else:
-            # Others get negative difference from first place
-            return float(player_score - first_place_score)
+        # Identify all tied winners
+        winners = {pid for score, pid in final_scores if score == first_place_score}
+
+        # Player score
+        player_score = next(score for score, pid in final_scores if pid == player_id)
+
+        # Config bonuses
+        win_bonus = getattr(self.config, "won_game_bonus", 0.0)
+        draw_bonus = getattr(self.config, "draw_bonus", 0.0)
+        second_bonus = getattr(self.config, "second_place_bonus", 0.0)
+
+        # ---- Case 1: Draw (tie for first) ----
+        if len(winners) > 1:
+            if player_id in winners:
+                return float(draw_bonus)
+            else:
+                # Non-winners still get shaped negative signal
+                return float(player_score - first_place_score)
+
+        # ---- Case 2: Unique winner ----
+        winner_id = next(iter(winners))
+
+        if player_id == winner_id:
+            return float((first_place_score - second_place_score) + win_bonus)
+
+        # ---- Case 3: Second place ----
+        # Find true second place score (may be multiple)
+        second_place_score = max(s for s in scores_only if s < first_place_score)
+        second_place_players = {pid for score, pid in final_scores if score == second_place_score}
+
+        if player_id in second_place_players:
+            return float((player_score - first_place_score) + second_bonus)
+
+        # ---- Case 4: Everyone else ----
+        return float(player_score - first_place_score)
 
     def get_connected_stations(self, player_id: int) -> set[int]:
         """Get the set of station node IDs this player has connected to.

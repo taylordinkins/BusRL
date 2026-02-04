@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from .opponent_pool import OpponentPool, CheckpointInfo
     from .elo_tracker import EloTracker
 
+import torch
+
 
 class PolicySlot:
     """Represents a policy assigned to a player slot.
@@ -47,6 +49,57 @@ class PolicySlot:
         self.policy = policy
         self.checkpoint_id = checkpoint_id
         self.is_training_policy = is_training_policy
+    
+    def _sample_from_policy_network(self, obs, action_mask):
+        """Sample action from policy network with fallback to random sampling.
+
+        If the policy network fails to sample (e.g., due to Simplex constraint
+        violations from numerical instability), falls back to uniform random
+        sampling from valid actions.
+        """
+        # Validate mask has at least one valid action
+        valid_actions = np.where(action_mask)[0]
+        if len(valid_actions) == 0:
+            import warnings
+            warnings.warn(
+                f"PolicySlot {self.checkpoint_id} received empty action mask, "
+                "cannot sample action. This should not happen."
+            )
+            return 0  # Return first action as emergency fallback
+
+        try:
+            with torch.no_grad():
+                obs_t = torch.as_tensor(obs).unsqueeze(0).to(self.policy.device)
+                mask_t = torch.as_tensor(action_mask).unsqueeze(0).to(self.policy.device)
+
+                dist = self.policy.policy.get_distribution(obs_t, action_masks=mask_t)
+                logits = dist.distribution.logits
+                if not torch.isfinite(logits).all():
+                    raise RuntimeError(
+                        f"Invalid logits in opponent policy {self.checkpoint_id}"
+                    )
+                # Sample directly from logits rather than dist.sample().
+                # The mask is already applied to logits by get_distribution.
+                # With 1670 actions, float32 softmax accumulation can push
+                # probs.sum() slightly off 1.0, triggering a spurious Simplex
+                # validation error on the probs tensor. Logits are correct;
+                # Categorical(logits=) produces the identical distribution.
+                action = torch.distributions.Categorical(logits=logits).sample()
+
+            return int(action.cpu().numpy()[0])
+
+        except (ValueError, RuntimeError) as e:
+            # Catch Simplex constraint violations and other distribution errors
+            # This can happen when the policy assigns very low probabilities to all
+            # valid actions, causing numerical precision issues after masking
+            import warnings
+            warnings.warn(
+                f"PolicySlot {self.checkpoint_id} failed to sample from policy "
+                f"distribution (error: {type(e).__name__}: {str(e)}). "
+                f"Falling back to random sampling from {len(valid_actions)} valid actions."
+            )
+            # Fall back to uniform random selection from valid actions
+            return int(np.random.choice(valid_actions))
 
     def get_action(self, obs: np.ndarray, action_mask: np.ndarray) -> int:
         """Get action from this policy.
@@ -68,9 +121,9 @@ class PolicySlot:
             return np.random.choice(valid_actions)
 
         # Use the policy to predict action
-        action, _ = self.policy.predict(obs, deterministic=False, action_masks=action_mask)
-        return int(action)
-
+        # action, _ = self.policy.predict(obs, deterministic=False, action_masks=action_mask)
+        # return int(action)
+        return self._sample_from_policy_network(obs, action_mask)
 
 class MultiPolicyBusEnv(gym.Wrapper):
     """Environment wrapper supporting different policies per player slot.
@@ -202,11 +255,23 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 if ckpt_id in valid_checkpoint_ids
             }
 
-        # Randomize training slot if enabled (learn to play from any position)
+        # # Randomize training slot if enabled (learn to play from any position)
+        # if self.randomize_training_slot:
+        #     self.training_slot = np.random.randint(0, self._num_players)
+        # else:
+        #     self.training_slot = self._initial_training_slot
+
+        self._seat_permutation = np.random.permutation(self._num_players)
+        self._inv_seat_permutation = np.argsort(self._seat_permutation)
+
+        # Training policy now sits in permuted seat
         if self.randomize_training_slot:
-            self.training_slot = np.random.randint(0, self._num_players)
+            logical_training_slot = np.random.randint(0, self._num_players)
         else:
-            self.training_slot = self._initial_training_slot
+            logical_training_slot = self._initial_training_slot
+
+        self.training_slot = self._seat_permutation[logical_training_slot]
+
 
         # Assign policies to player slots
         self._assign_policies()
@@ -295,8 +360,11 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # DEBUG: Log policy assignment
         # print(f"[MultiPolicyBusEnv] Assigning policies for episode (Training Slot: {self.training_slot})", flush=True)
 
-        for slot in range(self._num_players):
-            if slot == self.training_slot:
+        # for slot in range(self._num_players):
+        for logical_slot in range(self._num_players):
+            env_slot = self._seat_permutation[logical_slot]
+            # if slot == self.training_slot:
+            if env_slot == self.training_slot:
                 # Training slot uses current training policy
                 # In SubprocVecEnv, _training_policy is None, so we use self-play checkpoint
                 if self._training_policy is None:
@@ -513,6 +581,8 @@ class MultiPolicyBusEnv(gym.Wrapper):
         Returns:
             Tuple of (obs, info, terminated, truncated, cumulative_opponent_rewards).
         """
+        from core.constants import Phase
+
         terminated = False
         truncated = False
         total_opponent_reward = 0.0
@@ -538,18 +608,42 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 terminated = True
                 break
 
-            # Get opponent's action
-            policy_slot = self._policy_slots[current_player]
+            # Get current phase to determine if we should auto-advance
+            current_phase = self.env.unwrapped._engine.state.phase
+
+            # Get action mask
             action_mask = self.env.action_masks()
 
-            # Check if any valid actions
+            # Check if we're in a state that should auto-advance
+            # During RESOLVING_ACTIONS or CLEANUP, if there are no valid actions,
+            # we should use NOOP to trigger auto-advance instead of asking the policy
+            should_use_noop = False
             if not np.any(action_mask):
-                # No valid actions, game might be stuck or transitioning
-                break
+                # No valid actions - check if this is expected
+                if current_phase in (Phase.RESOLVING_ACTIONS, Phase.CLEANUP):
+                    # This is expected during resolution phases - some players may have
+                    # no valid actions (e.g., marker placed too far behind in queue,
+                    # no passengers to deliver, etc.). Use NOOP to trigger auto-advance.
+                    should_use_noop = True
+                    action = self.env.unwrapped._action_config.noop_idx
+                else:
+                    # Unexpected empty mask during player decision phase
+                    import warnings
+                    warnings.warn(
+                        f"Empty action mask during {current_phase.value} phase. "
+                        f"This may indicate a game engine issue."
+                    )
+                    # Try NOOP as fallback
+                    should_use_noop = True
+                    action = self.env.unwrapped._action_config.noop_idx
 
-            action = policy_slot.get_action(obs, action_mask)
+            # If not using NOOP, get action from opponent policy
+            if not should_use_noop:
+                logical_player = self._inv_seat_permutation[current_player]
+                policy_slot = self._policy_slots[logical_player]
+                action = policy_slot.get_action(obs, action_mask)
 
-            # Execute opponent's action
+            # Execute action (either from policy or NOOP)
             obs, opp_reward, terminated, truncated, info = self.env.step(action)
             total_opponent_reward += opp_reward
 
@@ -558,50 +652,179 @@ class MultiPolicyBusEnv(gym.Wrapper):
 
         return obs, info, terminated, truncated, total_opponent_reward
 
-    def _update_elo_ratings(self, info: dict) -> None:
-        """Update Elo ratings after a game ends.
+    # def _update_elo_ratings(self, info: dict) -> None:
+    #     """Update Elo ratings after a game ends.
 
-        Args:
-            info: Info dict from final step (should contain scores).
-        """
+    #     Args:
+    #         info: Info dict from final step (should contain scores).
+    #     """
+    #     if self.elo_tracker is None:
+    #         return
+
+    #     scores = info.get("scores", {})
+    #     if not scores:
+    #         return
+
+    #     # Build player_ids and final_scores lists
+    #     player_ids = self._current_episode_checkpoints
+    #     final_scores = [scores.get(i, 0) for i in range(len(player_ids))]
+
+    #     # Update ratings
+    #     self.elo_tracker.update_ratings_multiplayer(player_ids, final_scores)
+
+    #     # Also update win rates in opponent pool
+    #     if self.opponent_pool is not None:
+    #         winner_idx = final_scores.index(max(final_scores))
+    #         winner_id = player_ids[winner_idx]
+
+    #         for checkpoint_id in player_ids:
+    #             if checkpoint_id == "__current__":
+    #                 continue
+
+    #             checkpoint = self.opponent_pool.get_checkpoint_by_id(checkpoint_id)
+    #             if checkpoint is None:
+    #                 continue
+
+    #             # Update win rate against training policy
+    #             h2h = self.elo_tracker.get_head_to_head(checkpoint_id, "__current__")
+    #             if h2h.total_games > 0:
+    #                 # Win rate FROM checkpoint's perspective against training
+    #                 win_rate = h2h.win_rate_a if h2h.checkpoint_a == checkpoint_id else h2h.win_rate_b
+    #                 self.opponent_pool.update_checkpoint_stats(
+    #                     checkpoint_id=checkpoint_id,
+    #                     win_rate=win_rate,
+    #                     elo=self.elo_tracker.get_rating(checkpoint_id),
+    #                     games_played_delta=1,
+    #                 )
+    # def _update_elo_ratings(self, info: dict) -> None:
+    #     """Update Elo ratings after a multiplayer game ends."""
+
+    #     if self.elo_tracker is None:
+    #         return
+
+    #     scores = info.get("scores", None)
+    #     if not scores:
+    #         return
+
+    #     player_ids = self._current_episode_checkpoints
+    #     num_players = len(player_ids)
+
+    #     # Extract final scores in seat order
+    #     final_scores = [scores.get(i, 0) for i in range(num_players)]
+
+    #     # 1) Update multiplayer Elo properly
+    #     self.elo_tracker.update_ratings_multiplayer(player_ids, final_scores)
+
+    #     if self.opponent_pool is None:
+    #         return
+
+    #     training_id = "__current__"
+    #     training_seat = self.training_slot
+    #     training_score = final_scores[training_seat]
+
+    #     # 2) Update opponent pool stats per opponent seat
+    #     for seat, checkpoint_id in enumerate(player_ids):
+    #         if seat == training_seat:
+    #             continue
+
+    #         if checkpoint_id in ("__current__", "__training_subprocess__"):
+    #             continue
+
+    #         checkpoint = self.opponent_pool.get_checkpoint_by_id(checkpoint_id)
+    #         if checkpoint is None:
+    #             continue
+
+    #         opponent_score = final_scores[seat]
+
+    #         # Head-to-head result for this seat
+    #         if training_score > opponent_score:
+    #             win = 1.0
+    #         elif training_score < opponent_score:
+    #             win = 0.0
+    #         else:
+    #             win = 0.5
+
+    #         # Update running win-rate estimate against the training policy
+    #         self.opponent_pool.update_checkpoint_stats(
+    #             checkpoint_id=checkpoint_id,
+    #             win_rate=win,                  # one Bernoulli sample
+    #             elo=self.elo_tracker.get_rating(checkpoint_id),
+    #             games_played_delta=1,
+    #         )
+    def _update_elo_ratings(self, info: dict) -> None:
+        """Update Elo ratings after a multiplayer game ends, including seat-averaged win rates."""
+
         if self.elo_tracker is None:
             return
 
-        scores = info.get("scores", {})
+        scores = info.get("scores", None)
         if not scores:
             return
 
-        # Build player_ids and final_scores lists
         player_ids = self._current_episode_checkpoints
-        final_scores = [scores.get(i, 0) for i in range(len(player_ids))]
+        num_players = len(player_ids)
 
-        # Update ratings
+        # Extract final scores in seat order
+        final_scores = [scores.get(i, 0) for i in range(num_players)]
+
+        # 1) Update multiplayer Elo properly
         self.elo_tracker.update_ratings_multiplayer(player_ids, final_scores)
 
-        # Also update win rates in opponent pool
-        if self.opponent_pool is not None:
-            winner_idx = final_scores.index(max(final_scores))
-            winner_id = player_ids[winner_idx]
+        if self.opponent_pool is None:
+            return
 
-            for checkpoint_id in player_ids:
-                if checkpoint_id == "__current__":
-                    continue
+        training_id = "__current__"
+        training_seat = self.training_slot
+        training_score = final_scores[training_seat]
 
-                checkpoint = self.opponent_pool.get_checkpoint_by_id(checkpoint_id)
-                if checkpoint is None:
-                    continue
+        # Keep a running tally for seat-averaged win rate
+        seat_win_counts = {pid: [] for pid in player_ids if pid not in ("__current__", "__training_subprocess__")}
 
-                # Update win rate against training policy
-                h2h = self.elo_tracker.get_head_to_head(checkpoint_id, "__current__")
-                if h2h.total_games > 0:
-                    # Win rate FROM checkpoint's perspective against training
-                    win_rate = h2h.win_rate_a if h2h.checkpoint_a == checkpoint_id else h2h.win_rate_b
-                    self.opponent_pool.update_checkpoint_stats(
-                        checkpoint_id=checkpoint_id,
-                        win_rate=win_rate,
-                        elo=self.elo_tracker.get_rating(checkpoint_id),
-                        games_played_delta=1,
-                    )
+        # 2) Update opponent pool stats per opponent seat
+        for seat, checkpoint_id in enumerate(player_ids):
+            if seat == training_seat:
+                continue
+
+            if checkpoint_id in ("__current__", "__training_subprocess__"):
+                continue
+
+            checkpoint = self.opponent_pool.get_checkpoint_by_id(checkpoint_id)
+            if checkpoint is None:
+                continue
+
+            opponent_score = final_scores[seat]
+
+            # Head-to-head result for this seat
+            if training_score > opponent_score:
+                win = 1.0
+            elif training_score < opponent_score:
+                win = 0.0
+            else:
+                win = 0.5
+
+            # Track per-seat results
+            seat_win_counts[checkpoint_id].append(win)
+
+            # Update opponent pool with this seat's win rate (single sample)
+            self.opponent_pool.update_checkpoint_stats(
+                checkpoint_id=checkpoint_id,
+                win_rate=win,
+                elo=self.elo_tracker.get_rating(checkpoint_id),
+                games_played_delta=1,
+            )
+
+        # # 3) Compute seat-averaged win rates for each checkpoint
+        # for checkpoint_id, wins in seat_win_counts.items():
+        #     avg_win_rate = sum(wins) / len(wins) if wins else 0.0
+        #     self.opponent_pool.update_checkpoint_stats(
+        #         checkpoint_id=checkpoint_id,
+        #         win_rate=avg_win_rate,
+        #         # Keep Elo unchanged here (already updated)
+        #         elo=self.elo_tracker.get_rating(checkpoint_id),
+        #         games_played_delta=0,  # Do not double-count games
+        #     )
+
+
 
 
 class MatchRunner:
@@ -669,14 +892,9 @@ class MatchRunner:
 
             result = self._run_single_game(policies, ids)
 
-            # Attribute to original a/b
-            if randomize_seats and game_idx % 2 == 1:
-                # Seats were swapped
-                score_a = result["scores"][1]
-                score_b = result["scores"][0]
-            else:
-                score_a = result["scores"][0]
-                score_b = result["scores"][1]
+            # Scores are keyed by checkpoint_id — no seat-swap logic needed
+            score_a = result["avg_scores"][checkpoint_id_a]
+            score_b = result["avg_scores"][checkpoint_id_b]
 
             total_scores_a += score_a
             total_scores_b += score_b
@@ -736,12 +954,27 @@ class MatchRunner:
             expanded_policies = policies
             expanded_checkpoint_ids = checkpoint_ids
         # If we have 2 policies but need more players, fill extra slots with policy_b
+        # elif len(policies) == 2 and num_players > 2:
+        #     policy_a, policy_b = policies
+        #     checkpoint_id_a, checkpoint_id_b = checkpoint_ids
+        #     # Put policy_a in slot 0, fill rest with policy_b
+        #     expanded_policies = [policy_a] + [policy_b] * (num_players - 1)
+        #     expanded_checkpoint_ids = [checkpoint_id_a] + [f"{checkpoint_id_b}_slot{i}" for i in range(1, num_players)]
         elif len(policies) == 2 and num_players > 2:
             policy_a, policy_b = policies
             checkpoint_id_a, checkpoint_id_b = checkpoint_ids
-            # Put policy_a in slot 0, fill rest with policy_b
-            expanded_policies = [policy_a] + [policy_b] * (num_players - 1)
-            expanded_checkpoint_ids = [checkpoint_id_a] + [f"{checkpoint_id_b}_slot{i}" for i in range(1, num_players)]
+
+            # Seats 0 and 1 are pinned to guarantee each policy plays at least
+            # one seat; remaining seats are randomized to avoid team effects.
+            expanded_policies = [policy_a, policy_b]
+            expanded_checkpoint_ids = [checkpoint_id_a, checkpoint_id_b]
+            for i in range(2, num_players):
+                if np.random.rand() < 0.5:
+                    expanded_policies.append(policy_b)
+                    expanded_checkpoint_ids.append(checkpoint_id_b)
+                else:
+                    expanded_policies.append(policy_a)
+                    expanded_checkpoint_ids.append(checkpoint_id_a)
         else:
             raise ValueError(
                 f"Cannot run game: env requires {num_players} players but got {len(policies)} policies. "
@@ -760,7 +993,7 @@ class MatchRunner:
             current_player = env.get_current_player()
             action_mask = env.action_masks()
 
-            # Get action from current player's policy
+            # Get action from current player's policy (deterministic for eval)
             policy = expanded_policies[current_player]
             action, _ = policy.predict(obs, deterministic=True, action_masks=action_mask)
 
@@ -772,9 +1005,16 @@ class MatchRunner:
 
         env.close()
 
-        # Return only the scores for the original 2 policies (slots 0 and 1)
+        # Aggregate scores by policy: average across all seats each policy occupied
+        score_sums: dict[str, float] = {}
+        score_counts: dict[str, int] = {}
+        for seat, ckpt_id in enumerate(expanded_checkpoint_ids):
+            score_sums[ckpt_id] = score_sums.get(ckpt_id, 0.0) + scores.get(seat, 0)
+            score_counts[ckpt_id] = score_counts.get(ckpt_id, 0) + 1
+        avg_scores = {ckpt_id: score_sums[ckpt_id] / score_counts[ckpt_id] for ckpt_id in score_sums}
+
         return {
-            "scores": [scores.get(0, 0), scores.get(1, 0)],
+            "avg_scores": avg_scores,
             "checkpoint_ids": checkpoint_ids,
         }
 

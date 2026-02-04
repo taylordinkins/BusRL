@@ -22,6 +22,7 @@ except ImportError:
 
 from core.game_state import GameState
 from core.board import BoardGraph
+from core.constants import Phase
 from engine.game_engine import GameEngine, Action, ActionType
 from data.loader import load_default_board
 
@@ -100,8 +101,11 @@ class BusEnv(gym.Env):
         self._current_player_at_step: int = 0
         self._step_count: int = 0
         self._max_steps: int = 2000  # Default max steps per episode
+        self._active_step_count: int = 0
         self._stuck_counter: int = 0
         self._last_state_hash: str = ""
+        # For logging true episode lengths
+        self._episode_lengths: list[int] = []
 
         # Define spaces
         self.observation_space = spaces.Box(
@@ -135,83 +139,74 @@ class BusEnv(gym.Env):
 
         # Reset reward calculator
         self._reward_calculator.reset()
+
+        # Episode bookkeeping
         self._step_count = 0
-        self._stuck_counter = 0
-        self._last_state_hash = self._engine.state.state_hash()
 
         # Store initial state for reward computation
         self._prev_state = self._engine.state.clone()
         self._current_player_at_step = self._engine.state.global_state.current_player_idx
 
-        # Get initial observation
+        # Initial observation
         obs = self._get_observation()
         info = self._get_info()
 
         return obs, info
 
+
     def step(
         self,
         action: int,
     ) -> Tuple[np.ndarray, SupportsFloat, bool, bool, dict]:
-        """Execute one step in the environment.
-
-        Args:
-            action: Flat action index (0 to total_actions-1).
-
-        Returns:
-            Tuple of (observation, reward, terminated, truncated, info).
-        """
+        """Execute one step in the environment with debug logging."""
         if self._engine is None:
             raise RuntimeError("Environment not initialized. Call reset() first.")
 
-        # Store state before action for reward computation
         prev_state = self._prev_state
         acting_player = self._engine.state.global_state.current_player_idx
-        info = self._get_info() # Initialize info here
+        info = self._get_info()
 
         # Convert action index to Action object
         action_obj = self._action_mapping.index_to_action(action, self._engine.state)
 
-        # 1. Update step count and check limits
+        # 1. Increment step count
         self._step_count += 1
-        
-        # 2. Stuck detection: Check if state changed (even invalid actions count)
-        new_state_hash = self._engine.state.state_hash()
-        if new_state_hash == self._last_state_hash:
-            self._stuck_counter += 1
-        else:
-            self._stuck_counter = 0
-            self._last_state_hash = new_state_hash
 
-        truncated = (self._step_count >= self._max_steps) or (self._stuck_counter >= 50)
-        terminated = self._engine.is_game_over()
-
-        if truncated:
-             return self._get_observation(), 0.0, terminated, True, info
-
-        # 3. Handle NOOP
+        # 2. Handle NOOP
         if action_obj.params.get("noop", False):
             self._auto_advance()
         else:
-            # 4. Execute the action
+            # 3. Execute action
             step_result = self._engine.step(action_obj)
 
             if not step_result.success:
-                # Invalid action - return penalty
+                # Invalid action: penalize but do not advance or terminate
                 info["error"] = step_result.info.get("error", "Unknown error")
                 info["invalid_action"] = True
-                # Update previous state but don't advance
                 self._prev_state = self._engine.state.clone()
-                return self._get_observation(), self._reward_config.invalid_action_penalty, terminated, False, info
-            
-            # Action was successful, now auto-advance through automatic phases
-            self._auto_advance()
-        
-        # 5. Re-check state after potential advancement
-        terminated = self._engine.is_game_over()
-        truncated = (self._step_count >= self._max_steps) or (self._stuck_counter >= 50)
+                obs = self._get_observation()
+                return (
+                    obs,
+                    self._reward_config.invalid_action_penalty,
+                    False,
+                    False,
+                    info,
+                )
 
-        # Compute reward for the acting player
+            # Action succeeded — advance automatic phases if needed
+            self._auto_advance()
+
+        # 4. Re-check terminal and truncation
+        terminated = self._engine.is_game_over()
+        truncated = self._step_count >= self._max_steps
+        decision_made = not action_obj.params.get("noop", False) and step_result.success
+        if decision_made:
+            self._active_step_count += 1
+
+        #print(f"[DEBUG] Step {self._step_count}, phase={self._engine.state.phase}, decision_made={decision_made}, terminated={terminated}")
+
+
+        # 5. Compute reward
         action_info = {"action_type": action_obj.action_type.value}
         reward = self._reward_calculator.compute_reward(
             state=self._engine.state,
@@ -221,14 +216,14 @@ class BusEnv(gym.Env):
             action_info=action_info,
         )
 
-
-        # Update previous state
+        # 6. Update previous state
         self._prev_state = self._engine.state.clone()
         self._current_player_at_step = self._engine.state.global_state.current_player_idx
 
-        # Get new observation (from new current player's perspective)
+        # 7. Observation
         obs = self._get_observation()
-        # Merge existing info with fresh info
+
+        # 8. Merge info
         new_info = self._get_info()
         info.update(new_info)
         info["acting_player"] = acting_player
@@ -236,52 +231,66 @@ class BusEnv(gym.Env):
             self._engine.state, prev_state, acting_player, terminated, action_info
         ).__dict__
 
-        # If terminal, log extra final info
         if terminated or truncated:
+            self._episode_lengths.append(self._active_step_count)
+            self._active_step_count = 0  # reset for next episode
             info["game_over"] = True
+            # print(
+            #     f"Step {self._step_count}, Active Step{self._active_step_count}, phase={self._engine.state.phase}, "
+            #     f"terminated={terminated}, truncated={truncated}, "
+            #     f"valid_actions={len(self._engine.get_valid_actions())}"
+            # )
+
+        # Debug print
+        # print(
+        #     f"Step {self._step_count}, phase={self._engine.state.phase}, "
+        #     f"terminated={terminated}, truncated={truncated}, "
+        #     f"valid_actions={len(self._engine.get_valid_actions())}"
+        # )
 
         return obs, float(reward), terminated, truncated, info
 
+
     def _auto_advance(self) -> None:
-        """Auto-advance through phases that don't require player decisions.
-    
-        This handles phases like CLEANUP and RESOLVING_ACTIONS when
-        there are no player choices to make.
-        """
+        """Auto-advance through phases that do not require player decisions."""
         if self._engine is None:
             return
 
-        max_iterations = 100  # Safety limit
-        for _ in range(max_iterations):
+        max_iterations = 200  # Safety limit
+        for i in range(max_iterations):
             if self._engine.is_game_over():
+                #print(f"_auto_advance: game over reached at iteration {i}")
                 break
 
-            # Get valid actions for current state
+            phase = self._engine.state.phase
             valid_actions = self._engine.get_valid_actions()
 
-            if len(valid_actions) > 0:
-                # Player has choices to make
-                break
-
-            # No valid actions - check if we need to advance phases
-            phase = self._engine.state.phase
-
-            if phase.value == "cleanup":
-                # Execute cleanup and transition
-                result = self._engine.resolve_cleanup()
-                if not result.success:
-                    break
-            elif phase.value == "resolving_actions":
-                # Auto-resolve all actions using the ActionResolver
+            # 1. RESOLVING_ACTIONS -> fully auto-resolve
+            if phase == Phase.RESOLVING_ACTIONS:
+                # print(f"_auto_advance: resolving actions at iteration {i}")
                 self._auto_resolve_actions()
-            else:
-                # No actions and not cleanup/resolving - stuck or game over
+                # Count this as a step
+                self._step_count += 1
+                continue  # stay in loop until phase changes or game over
+
+            # 2. CLEANUP or other automatic phases
+            if phase == Phase.CLEANUP:
+                result = self._engine.resolve_cleanup()
+                self._step_count += 1
+                if not result.success:
+                    print(f"_auto_advance: cleanup failed at iteration {i}")
+                    break
+                continue
+
+            # 3. Player must act
+            if len(valid_actions) > 0:
+                #print(f"_auto_advance: stopping at player choice at iteration {i}")
                 break
-        
-        # Diagnostic: If we hit max iterations, something is very wrong
-        # Removed verbose print
-        # Removed verbose print
-        # Removed verbose print
+
+            # 4. No valid actions and not a resolvable phase -> likely stuck
+            #print(f"_auto_advance: no valid actions, stopping at iteration {i}")
+            break
+
 
     def _auto_resolve_actions(self) -> None:
         """Auto-resolve the RESOLVING_ACTIONS phase.
@@ -312,10 +321,35 @@ class BusEnv(gym.Env):
         """
         if self._engine is None:
             # Return all-invalid mask if not initialized
-            return np.zeros(self._action_config.total_actions, dtype=np.bool_)
+            #return np.zeros(self._action_config.total_actions, dtype=np.bool_)
+            mask = np.zeros(self._action_config.total_actions, dtype=np.bool_)
+            mask[self._action_config.noop_idx] = True
+            return mask
 
         valid_actions = self._engine.get_valid_actions()
-        return self._mask_generator.generate_mask(self._engine.state, valid_actions)
+        if len(valid_actions) == 0:
+            # Auto-advance phases may legitimately yield no actions for this player.
+            if self._engine.is_game_over() or self._engine.state.phase in (
+                Phase.RESOLVING_ACTIONS,
+                Phase.CLEANUP,
+            ):
+                mask = np.zeros(self._action_config.total_actions, dtype=np.bool_)
+                mask[self._action_config.noop_idx] = True
+                return mask
+            raise RuntimeError(
+                "No valid actions in a decision phase. "
+                "This indicates a game engine or masking bug."
+            )
+
+        action_mask = self._mask_generator.generate_mask(self._engine.state, valid_actions)
+        if not np.any(action_mask):
+            raise RuntimeError("EMPTY ACTION MASK — THIS WILL CRASH PPO")
+
+        if np.any(np.isnan(action_mask)):
+            raise RuntimeError("NaN IN MASK")
+
+        return action_mask
+
 
     def _get_observation(self) -> np.ndarray:
         """Get observation tensor for the current player."""
@@ -353,7 +387,7 @@ class BusEnv(gym.Env):
             return None
 
         if self.render_mode == "human":
-            print(self._engine.state)
+            #print(self._engine.state)
             return None
         elif self.render_mode == "ansi":
             return str(self._engine.state)

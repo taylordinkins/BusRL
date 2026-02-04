@@ -11,18 +11,22 @@ Supports two training modes:
 
 import os
 import sys
+import json
 import argparse
 from datetime import datetime
 from pathlib import Path
+from functools import partial
 
 # Add project root to sys.path to allow importing from rl module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gymnasium as gym
 import numpy as np
-from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
+import torch
+from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy, MaskableActorCriticPolicy
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.ppo_mask import MaskablePPO
+
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.monitor import Monitor
@@ -37,12 +41,26 @@ from rl.callbacks import (
     OpponentPoolCallback,
     OpponentPoolEvalCallback,
     MultiPolicyTrainingCallback,
+    TrueEpisodeLengthCallback,
+    DiagnosticMaskingCallback,
 )
+
+#########
+# UNSURE IF THIS IS ACTUALLY TRUE
+# # MaskableCategorical calls Categorical.__init__() multiple times during
+# # apply_masking().  On the second call, PyTorch's Distribution.__init__
+# # validates a stale self.probs (cached from the previous __init__) against
+# # the Simplex constraint.  With 1670 categories the fp32 sum of softmax
+# # output can drift past the 1e-6 tolerance, triggering a spurious ValueError.
+# # Validation is a debug-only check — disable it globally for training.
+# torch.distributions.Distribution.set_default_validate_args(False)
+##########
 
 
 def make_base_env(num_players: int) -> BusEnv:
     """Create a base BusEnv instance."""
     return BusEnv(num_players=num_players)
+
 
 
 class EntropyDecayCallback(BaseCallback):
@@ -65,6 +83,9 @@ class EntropyDecayCallback(BaseCallback):
 
 def train(args):
     """Run training for the Bus RL agent."""
+    if args.disable_dist_validate:
+        # Disable debug-only distribution validation to avoid Simplex drift
+        torch.distributions.Distribution.set_default_validate_args(False)
 
     # Create base log directory
     os.makedirs("logs", exist_ok=True)
@@ -84,7 +105,7 @@ def train(args):
         )
 
         # Determine pool directory (use existing if provided, otherwise create new)
-        if args.load_pool_dir:
+        if args.load_pool_dir and not args.start_fresh_directory:
             pool_dir = args.load_pool_dir
             print(f"Loading existing opponent pool from: {pool_dir}")
         else:
@@ -111,6 +132,11 @@ def train(args):
         print(f"  Save interval: {args.pool_save_interval}")
         print(f"  Prune strategy: {args.prune_strategy}")
         print(f"  Multi-policy mode: {args.multi_policy}")
+
+        # Prime fresh pool from an existing one if requested
+        if args.load_pool_dir and args.start_fresh_directory:
+            n_primed = opponent_pool.prime_from_pool(args.load_pool_dir)
+            print(f"  Primed {n_primed} checkpoints from {args.load_pool_dir}")
 
         if len(opponent_pool) > 0:
             print(f"  Elo range: {opponent_pool.best_elo():.1f} - {opponent_pool.best_elo() - opponent_pool.elo_spread():.1f}")
@@ -279,6 +305,19 @@ def train(args):
     )
     callbacks.append(eval_callback)
 
+    # Diagnostic masking callback (low-frequency)
+    if args.diag_log_interval > 0:
+        diag_callback = DiagnosticMaskingCallback(
+            log_interval=args.diag_log_interval,
+            max_samples=args.diag_log_samples,
+            prob_sum_tol=args.diag_log_tolerance,
+            verbose=0,
+        )
+        callbacks.append(diag_callback)
+
+    true_ep_len_callback = TrueEpisodeLengthCallback(env)
+    callbacks.append(true_ep_len_callback)
+
     # Entropy decay callback
     if args.ent_coef_final < args.ent_coef:
         entropy_callback = EntropyDecayCallback(
@@ -300,15 +339,18 @@ def train(args):
         )
         callbacks.append(pool_callback)
 
+
         # Pool evaluation callback (actual head-to-head matches)
         if args.pool_eval_interval > 0:
+            env_factory = partial(make_base_env, args.num_players)
             pool_eval_callback = OpponentPoolEvalCallback(
                 opponent_pool=opponent_pool,
                 elo_tracker=elo_tracker,
-                env_factory=lambda: make_base_env(args.num_players),
+                env_factory=env_factory,
                 eval_interval=args.pool_eval_interval,
                 n_eval_games=args.pool_eval_games,
                 max_opponents=args.pool_eval_opponents,
+                best_model_save_path=os.path.join(log_dir, "best_pool_model"),
                 verbose=1,
             )
             callbacks.append(pool_eval_callback)
@@ -324,7 +366,7 @@ def train(args):
 
     # Initialize model
     model = MaskablePPO(
-        "MlpPolicy",
+        MaskableActorCriticPolicy, #"MlpPolicy",
         env,
         verbose=1,
         learning_rate=args.lr,
@@ -339,6 +381,37 @@ def train(args):
         tensorboard_log="logs",
         device=args.device,
     )
+    # Load initial checkpoint if provided
+    if args.initial_checkpoint:
+        print(f"Loading initial checkpoint weights from {args.initial_checkpoint}...")
+
+        # Print checkpoint metadata if available (works for both best_pool_model
+        # saves and raw opponent pool checkpoints)
+        _ckpt_dir = os.path.dirname(os.path.abspath(args.initial_checkpoint))
+        _info_path = os.path.join(_ckpt_dir, "best_model_info.json")
+        _pool_state_path = os.path.join(_ckpt_dir, "pool_state.json")
+        if os.path.exists(_info_path):
+            with open(_info_path) as f:
+                _info = json.load(f)
+            print(f"  Best pool model: win_rate={_info.get('win_rate', 0):.3f}, "
+                  f"elo={_info.get('elo', 0):.1f}, step={_info.get('step', 0)}")
+        elif os.path.exists(_pool_state_path):
+            with open(_pool_state_path) as f:
+                _pool_state = json.load(f)
+            _ckpt_name = os.path.basename(args.initial_checkpoint).removesuffix(".zip")
+            for _ckpt in _pool_state.get("checkpoints", []):
+                if _ckpt.get("checkpoint_id") == _ckpt_name:
+                    print(f"  Pool checkpoint: elo={_ckpt.get('elo', 0):.1f}, "
+                          f"step={_ckpt.get('step', 0)}, "
+                          f"games_played={_ckpt.get('games_played', 0)}")
+                    break
+
+        model = MaskablePPO.load(
+            args.initial_checkpoint,
+            env=env,       # important to pass the current env
+            device=args.device,
+        )
+
 
     # Set training policy reference for multi-policy environments (DummyVecEnv only)
     # For SubprocVecEnv, environments use self_play_checkpoint_path or pool checkpoints
@@ -409,13 +482,13 @@ if __name__ == "__main__":
     )
 
     # Environment args
-    parser.add_argument("--num-players", type=int, default=4,
+    parser.add_argument("--num_players", type=int, default=4,
                         help="Number of players in game")
-    parser.add_argument("--n-envs", type=int, default=4,
+    parser.add_argument("--n_envs", type=int, default=4,
                         help="Number of parallel environments")
 
     # Training args
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000,
+    parser.add_argument("--total_timesteps", type=int, default=1_000_000,
                         help="Total steps to train")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
@@ -427,63 +500,73 @@ if __name__ == "__main__":
                         help="Epochs per update")
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor")
-    parser.add_argument("--gae_lambda", type=float, default=0.95,
+    parser.add_argument("--gae_lambda", type=float, default=0.98,
                         help="GAE lambda")
     parser.add_argument("--clip_range", type=float, default=0.2,
                         help="PPO clip range")
     parser.add_argument("--ent_coef", type=float, default=0.01,
                         help="Initial entropy coefficient")
-    parser.add_argument("--ent-coef-final", type=float, default=0.01,
+    parser.add_argument("--ent_coef_final", type=float, default=0.01,
                         help="Final entropy coefficient (if less than initial, decay will occur)")
     parser.add_argument("--target_kl", type=float, default=0.03,
                         help="Target KL divergence")
 
     # Logging and saving
-    parser.add_argument("--save-freq", type=int, default=50_000,
+    parser.add_argument("--save_freq", type=int, default=5_000,
                         help="Save frequency")
-    parser.add_argument("--eval-freq", type=int, default=10_000,
+    parser.add_argument("--eval_freq", type=int, default=10_000,
                         help="Eval frequency")
-    parser.add_argument("--n-eval-episodes", type=int, default=5,
+    parser.add_argument("--n_eval_episodes", type=int, default=5,
                         help="Number of eval episodes")
     parser.add_argument("--device", type=str, default="auto",
                         help="torch device")
+    parser.add_argument("--disable_dist_validate", action="store_true",
+                        help="Disable torch Distribution validation (avoids Simplex drift errors with large action spaces)")
+    parser.add_argument("--diag_log_interval", type=int, default=0,
+                        help="Diagnostic logging interval in timesteps (0 to disable)")
+    parser.add_argument("--diag_log_samples", type=int, default=256,
+                        help="Max samples per diagnostic interval")
+    parser.add_argument("--diag_log_tolerance", type=float, default=5e-5,
+                        help="Tolerance for probs sum deviation before counting as bad")
 
     # Opponent pool args
-    parser.add_argument("--use-opponent-pool", action="store_true",
+    parser.add_argument("--use_opponent_pool", action="store_true",
                         help="Enable opponent pool for self-play diversity")
-    parser.add_argument("--load-pool-dir", type=str, default=None,
+    parser.add_argument("--load_pool_dir", type=str, default=None,
                         help="Path to existing opponent pool directory to continue from (e.g., logs/ppo_bus_20260122_123456/opponent_pool)")
-    parser.add_argument("--pool-size", type=int, default=20,
+    parser.add_argument("--start_fresh_directory", action="store_true",
+                        help="Start a fresh opponent pool instead of saving into --load_pool_dir. Primes the new pool with top 3 by Elo + 2 random checkpoints from --load_pool_dir")
+    parser.add_argument("--pool_size", type=int, default=20,
                         help="Max checkpoints in opponent pool")
-    parser.add_argument("--pool-save-interval", type=int, default=50_000,
+    parser.add_argument("--pool_save_interval", type=int, default=5000,
                         help="Steps between pool checkpoint saves")
-    parser.add_argument("--prune-strategy", type=str, default="oldest",
+    parser.add_argument("--prune_strategy", type=str, default="oldest",
                         choices=["oldest", "lowest_elo", "least_diverse"],
                         help="Strategy for pruning pool when full")
 
     # Multi-policy training args
-    parser.add_argument("--multi-policy", action="store_true",
+    parser.add_argument("--multi_policy", action="store_true",
                         help="Enable multi-policy training (train against pool opponents)")
-    parser.add_argument("--self-play-prob", type=float, default=0.2,
+    parser.add_argument("--self_play_prob", type=float, default=0.2,
                         help="Probability of self-play vs pool opponent")
-    parser.add_argument("--sampling-method", type=str, default="pfsp",
+    parser.add_argument("--sampling_method", type=str, default="pfsp",
                         choices=["uniform", "latest", "pfsp", "elo_weighted"],
                         help="Method for sampling opponents from pool")
-    parser.add_argument("--randomize-training-slot", action="store_true",
+    parser.add_argument("--randomize_training_slot", action="store_true",
                         help="Randomize which player position is trained each episode (learn to play from any seat)")
-    parser.add_argument("--initial-checkpoint", type=str, default=None,
+    parser.add_argument("--initial_checkpoint", type=str, default=None,
                         help="Path to initial checkpoint for self-play opponents (required for SubprocVecEnv with self_play_prob > 0)")
 
     # Pool evaluation args
-    parser.add_argument("--pool-eval-interval", type=int, default=100_000,
+    parser.add_argument("--pool_eval_interval", type=int, default=100_000,
                         help="Steps between pool evaluation (0 to disable)")
-    parser.add_argument("--pool-eval-games", type=int, default=5,
+    parser.add_argument("--pool_eval_games", type=int, default=20,
                         help="Games per opponent for pool evaluation")
-    parser.add_argument("--pool-eval-opponents", type=int, default=5,
+    parser.add_argument("--pool_eval_opponents", type=int, default=5,
                         help="Max opponents to evaluate against per interval")
 
     # Elo args
-    parser.add_argument("--elo-k-factor", type=float, default=32.0,
+    parser.add_argument("--elo_k_factor", type=float, default=32.0,
                         help="Elo K-factor (higher = more volatile ratings)")
 
     args = parser.parse_args()
@@ -492,6 +575,9 @@ if __name__ == "__main__":
     if args.multi_policy and not args.use_opponent_pool:
         print("Warning: --multi-policy requires --use-opponent-pool. Enabling opponent pool.")
         args.use_opponent_pool = True
+
+    if args.start_fresh_directory and not args.load_pool_dir:
+        print("Warning: --start_fresh_directory has no effect without --load_pool_dir.")
 
     if args.load_pool_dir:
         # Automatically enable opponent pool if loading from existing directory

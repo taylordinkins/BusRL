@@ -76,6 +76,7 @@ class ActionMaskGenerator:
                     "This indicates a game engine or masking bug."
                 )
 
+        assert mask.any()
         return mask
 
     def get_valid_action_indices(self, mask: np.ndarray) -> np.ndarray:
@@ -85,9 +86,9 @@ class ActionMaskGenerator:
         """Convert boolean mask to logits mask.
 
         Valid actions → 0.0
-        Invalid actions → -inf (not -1e8!)
+        Invalid actions → -1e8 (matches sb3-contrib MaskableCategorical)
         """
-        logits_mask = np.full(mask.shape, -np.inf, dtype=np.float32)
+        logits_mask = np.full(mask.shape, -1e8, dtype=np.float32)
         logits_mask[mask] = 0.0
         return logits_mask
 
