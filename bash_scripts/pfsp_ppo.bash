@@ -18,7 +18,6 @@ python scripts/train.py \
     --prune_strategy lowest_elo \
     --multi_policy \
     --self_play_prob 0.2 \
-    --sampling_method pfsp \
     --randomize_training_slot \
     --disable_dist_validate \
     --diag_log_interval 100000 \

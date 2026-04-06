@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .elo_tracker import EloTracker
 
 import torch
+from .policies import BusMaskableActorCriticPolicy
 
 
 class PolicySlot:
@@ -432,7 +433,18 @@ class MultiPolicyBusEnv(gym.Wrapper):
             policy.save(tmp_path)
             
             # Load it back (creates independent copy)
-            frozen = MaskablePPO.load(tmp_path, device="cpu")
+            frozen = MaskablePPO.load(
+                tmp_path,
+                device="cpu",
+                custom_objects={
+                    "policy_class": BusMaskableActorCriticPolicy,
+                    "policy_kwargs": {
+                        "logit_clamp": True,
+                        "logit_clamp_min": -20.0,
+                        "logit_clamp_max": 20.0,
+                    },
+                },
+            )
             
             # Put in evaluation mode and disable gradients
             frozen.policy.set_training_mode(False)
@@ -484,7 +496,18 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 mtime = os.path.getmtime(path_with_ext)
                 if mtime > self._self_play_mtime:
                     # File has changed, reload
-                    loaded = MaskablePPO.load(self.self_play_checkpoint_path, device="cpu")
+                    loaded = MaskablePPO.load(
+                        self.self_play_checkpoint_path,
+                        device="cpu",
+                        custom_objects={
+                            "policy_class": BusMaskableActorCriticPolicy,
+                            "policy_kwargs": {
+                                "logit_clamp": True,
+                                "logit_clamp_min": -20.0,
+                                "logit_clamp_max": 20.0,
+                            },
+                        },
+                    )
                     # Freeze it
                     loaded.policy.set_training_mode(False)
                     for param in loaded.policy.parameters():

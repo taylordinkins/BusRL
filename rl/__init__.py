@@ -24,6 +24,7 @@ from .config import (
 )
 from .observation import ObservationEncoder
 from .action_space import ActionMapping
+from .hierarchical_action_space import HeadId, HierarchicalActionMapping, get_head_id, VRROOMM_SKIP
 from .action_masking import ActionMaskGenerator
 from .reward import RewardCalculator, StepRewardInfo
 from .bus_env import BusEnv, make_bus_env
@@ -34,10 +35,13 @@ from .openskill_tracker import OpenSkillTracker
 from .multi_policy_env import MultiPolicyBusEnv, PolicySlot, MatchRunner
 from .mcts import MCTS, MCTSNode, MCTSConfig
 from .mcts_player import MCTSPlayer, PolicyPlayer, MCTSPlayerStats
+from .vrroomm_stage import VrroommStageState
+from .policies import BusMaskableActorCriticPolicy
 from .callbacks import (
     OpponentPoolCallback,
     OpponentPoolEvalCallback,
     MultiPolicyTrainingCallback,
+    HeadUsageCallback,
 )
 
 __all__ = [
@@ -54,6 +58,10 @@ __all__ = [
     "ObservationEncoder",
     # Action space
     "ActionMapping",
+    "HeadId",
+    "HierarchicalActionMapping",
+    "get_head_id",
+    "VRROOMM_SKIP",
     # Action masking
     "ActionMaskGenerator",
     # Reward
@@ -84,8 +92,11 @@ __all__ = [
     "MCTSPlayer",
     "PolicyPlayer",
     "MCTSPlayerStats",
+    "VrroommStageState",
+    "BusMaskableActorCriticPolicy",
     # Callbacks
     "OpponentPoolCallback",
     "OpponentPoolEvalCallback",
     "MultiPolicyTrainingCallback",
+    "HeadUsageCallback",
 ]

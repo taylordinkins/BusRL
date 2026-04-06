@@ -24,6 +24,7 @@ from core.constants import (
     MAX_BUSES,
 )
 from .config import ObservationConfig, DEFAULT_OBS_CONFIG
+from .hierarchical_action_space import HeadId, get_head_id
 
 
 class ObservationEncoder:
@@ -75,13 +76,22 @@ class ObservationEncoder:
         """Total dimension of the flat observation tensor."""
         return self.config.total_observation_dim
 
-    def encode(self, state: GameState, current_player_id: Optional[int] = None) -> np.ndarray:
+    def encode(
+        self,
+        state: GameState,
+        current_player_id: Optional[int] = None,
+        head_id: Optional[HeadId] = None,
+        vrroomm_stage: int = 0,
+    ) -> np.ndarray:
         """Encode complete game state into flat observation tensor.
 
         Args:
             state: The GameState to encode.
             current_player_id: The player whose perspective to use.
                 If None, uses state.global_state.current_player_idx.
+            head_id: Optional hierarchical head id for this decision.
+                If None, computed from state + vrroomm_stage.
+            vrroomm_stage: Vrroomm stage (0=none, 1=passenger, 2=destination).
 
         Returns:
             Flat numpy array of shape (total_observation_dim,) with dtype float32.
@@ -102,7 +112,9 @@ class ObservationEncoder:
         offset = self._encode_players(state, current_player_id, obs, offset)
         offset = self._encode_action_board(state, current_player_id, obs, offset)
         offset = self._encode_passengers(state, obs, offset)
-        offset = self._encode_global(state, current_player_id, obs, offset)
+        offset = self._encode_global(
+            state, current_player_id, obs, offset, head_id, vrroomm_stage
+        )
 
         return obs
 
@@ -426,11 +438,17 @@ class ObservationEncoder:
         return offset + self.config.passenger_features_size
 
     def _encode_global(
-        self, state: GameState, current_player_id: int, obs: np.ndarray, offset: int
+        self,
+        state: GameState,
+        current_player_id: int,
+        obs: np.ndarray,
+        offset: int,
+        head_id: Optional[HeadId],
+        vrroomm_stage: int,
     ) -> int:
         """Encode global state features into observation tensor.
 
-        Global features (27 total):
+        Global features (39 total):
         - phase (7): one-hot
         - round_number (1): normalized
         - time_clock_position (3): one-hot
@@ -439,6 +457,8 @@ class ObservationEncoder:
         - current_resolution_slot (6): one-hot (during resolution)
         - max_buses (1): M#oB value normalized
         - all_players_passed (1): binary
+        - head_id (10): one-hot (hierarchical decision head)
+        - vrroomm_stage (2): one-hot (stage 1/2, zeros outside vrroomm)
         """
         base = offset
         i = 0
@@ -487,6 +507,21 @@ class ObservationEncoder:
         # All players passed
         obs[base + i] = 1.0 if state.all_players_passed() else 0.0
         i += 1
+
+        # Head id (one-hot, 10 values)
+        if head_id is None:
+            res_area = state.global_state.get_current_resolution_area()
+            head_id = get_head_id(state.phase, res_area, vrroomm_stage)
+        head_idx = head_id.value if isinstance(head_id, HeadId) else None
+        for h_idx in range(self.config.HEAD_ID_DIM):
+            obs[base + i] = 1.0 if head_idx == h_idx else 0.0
+            i += 1
+
+        # Vrroomm stage (one-hot, 2 values; stage 0 = all zeros)
+        stage_value = int(vrroomm_stage)
+        for s_idx in range(self.config.VRROOMM_STAGE_DIM):
+            obs[base + i] = 1.0 if stage_value == (s_idx + 1) else 0.0
+            i += 1
 
         return offset + self.config.global_features_size
 

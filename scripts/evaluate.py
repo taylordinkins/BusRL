@@ -29,6 +29,7 @@ from sb3_contrib.common.maskable.utils import get_action_masks
 
 from rl.bus_env import BusEnv
 from rl.wrappers import BusEnvSelfPlayWrapper
+from rl.policies import BusMaskableActorCriticPolicy
 
 
 def evaluate(args):
@@ -38,7 +39,19 @@ def evaluate(args):
 
     # Load model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MaskablePPO.load(args.model_path, device=device)
+    policy_kwargs = {
+        "logit_clamp": args.logit_clamp,
+        "logit_clamp_min": args.logit_clamp_min,
+        "logit_clamp_max": args.logit_clamp_max,
+    }
+    model = MaskablePPO.load(
+        args.model_path,
+        device=device,
+        custom_objects={
+            "policy_class": BusMaskableActorCriticPolicy,
+            "policy_kwargs": policy_kwargs,
+        },
+    )
 
     # Create player based on mode
     if args.use_mcts:
@@ -144,7 +157,19 @@ def compare_mcts(args):
 
     # Load model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = MaskablePPO.load(args.model_path, device=device)
+    policy_kwargs = {
+        "logit_clamp": args.logit_clamp,
+        "logit_clamp_min": args.logit_clamp_min,
+        "logit_clamp_max": args.logit_clamp_max,
+    }
+    model = MaskablePPO.load(
+        args.model_path,
+        device=device,
+        custom_objects={
+            "policy_class": BusMaskableActorCriticPolicy,
+            "policy_kwargs": policy_kwargs,
+        },
+    )
 
     # Create players
     config = MCTSConfig(
@@ -195,6 +220,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-games", type=int, default=10, help="Number of games to play")
     parser.add_argument("--num-players", type=int, default=4, help="Number of players in game")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--no-logit-clamp", action="store_true",
+                        help="Disable logit clamping (enabled by default)")
+    parser.add_argument("--logit_clamp_min", type=float, default=-20.0,
+                        help="Minimum logit clamp value (when logit clamp enabled)")
+    parser.add_argument("--logit_clamp_max", type=float, default=20.0,
+                        help="Maximum logit clamp value (when logit clamp enabled)")
 
     # MCTS options
     parser.add_argument("--use-mcts", action="store_true",
@@ -217,6 +248,8 @@ if __name__ == "__main__":
                         help="Run comparison between MCTS and policy-only")
 
     args = parser.parse_args()
+
+    args.logit_clamp = not args.no_logit_clamp
 
     if args.compare_mcts:
         compare_mcts(args)

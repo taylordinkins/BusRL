@@ -22,8 +22,9 @@ except ImportError:
 
 from core.game_state import GameState
 from core.board import BoardGraph
-from core.constants import Phase
+from core.constants import Phase, ActionAreaType, ACTION_RESOLUTION_ORDER
 from engine.game_engine import GameEngine, Action, ActionType
+from engine.action_resolver import ActionResolver, ResolutionStatus
 from data.loader import load_default_board
 
 from .config import (
@@ -35,9 +36,14 @@ from .config import (
     DEFAULT_REWARD_CONFIG,
 )
 from .observation import ObservationEncoder
-from .action_space import ActionMapping
-from .action_masking import ActionMaskGenerator
+from .hierarchical_action_space import (
+    HierarchicalActionMapping,
+    HeadId,
+    get_head_id,
+    VRROOMM_SKIP,
+)
 from .reward import RewardCalculator
+from .vrroomm_stage import VrroommStageState
 
 
 class BusEnv(gym.Env):
@@ -92,9 +98,14 @@ class BusEnv(gym.Env):
         # Core components
         self._engine: Optional[GameEngine] = None
         self._obs_encoder = ObservationEncoder(obs_config)
-        self._action_mapping = ActionMapping(self._board, action_config)
-        self._mask_generator = ActionMaskGenerator(self._action_mapping, action_config)
+        self._hier_action_mapping = HierarchicalActionMapping(self._board)
+        self._max_head_actions = max(
+            self._hier_action_mapping.head_size(head_id) for head_id in HeadId
+        )
         self._reward_calculator = RewardCalculator(reward_config)
+        self._resolver: Optional[ActionResolver] = None
+        self._decision_cache: Optional[dict[str, Any]] = None
+        self._vrroomm_stage_state = VrroommStageState()
 
         # State tracking
         self._prev_state: Optional[GameState] = None
@@ -114,7 +125,7 @@ class BusEnv(gym.Env):
             shape=(obs_config.total_observation_dim,),
             dtype=np.float32,
         )
-        self.action_space = spaces.Discrete(action_config.total_actions)
+        self.action_space = spaces.Discrete(self._max_head_actions)
 
     def reset(
         self,
@@ -139,6 +150,9 @@ class BusEnv(gym.Env):
 
         # Reset reward calculator
         self._reward_calculator.reset()
+        self._resolver = None
+        self._decision_cache = None
+        self._vrroomm_stage_state.complete()
 
         # Episode bookkeeping
         self._step_count = 0
@@ -158,7 +172,7 @@ class BusEnv(gym.Env):
         self,
         action: int,
     ) -> Tuple[np.ndarray, SupportsFloat, bool, bool, dict]:
-        """Execute one step in the environment with debug logging."""
+        """Execute one step in the environment with hierarchical action flow."""
         if self._engine is None:
             raise RuntimeError("Environment not initialized. Call reset() first.")
 
@@ -166,21 +180,49 @@ class BusEnv(gym.Env):
         acting_player = self._engine.state.global_state.current_player_idx
         info = self._get_info()
 
-        # Convert action index to Action object
-        action_obj = self._action_mapping.index_to_action(action, self._engine.state)
-
-        # 1. Increment step count
+        # Increment step count
         self._step_count += 1
 
-        # 2. Handle NOOP
-        if action_obj.params.get("noop", False):
-            self._auto_advance()
-        else:
-            # 3. Execute action
-            step_result = self._engine.step(action_obj)
+        decision = self._get_decision_context()
+        head_id = decision.get("head_id") if decision else None
+        mask = decision.get("mask") if decision else None
 
+        if head_id is None or mask is None:
+            # No decision required; auto-advance and return
+            self._advance_after_action()
+            terminated = self._engine.is_game_over()
+            truncated = self._step_count >= self._max_steps
+            reward = 0.0
+            obs = self._get_observation()
+            return obs, reward, terminated, truncated, info
+
+        # Validate chosen action against mask
+        if not (0 <= action < len(mask)) or not mask[action]:
+            info["invalid_action"] = True
+            self._prev_state = self._engine.state.clone()
+            obs = self._get_observation()
+            return (
+                obs,
+                self._reward_config.invalid_action_penalty,
+                False,
+                False,
+                info,
+            )
+
+        action_info: dict[str, Any] = {"action_type": head_id.name}
+
+        # Apply action based on head
+        if head_id in (
+            HeadId.SETUP_BUILDINGS,
+            HeadId.SETUP_RAILS_FORWARD,
+            HeadId.SETUP_RAILS_REVERSE,
+            HeadId.CHOOSING_ACTIONS,
+        ):
+            if action not in decision["valid_index_to_action"]:
+                raise RuntimeError("Chosen action not in valid action mapping")
+            action_obj = decision["valid_index_to_action"][action]
+            step_result = self._engine.step(action_obj)
             if not step_result.success:
-                # Invalid action: penalize but do not advance or terminate
                 info["error"] = step_result.info.get("error", "Unknown error")
                 info["invalid_action"] = True
                 self._prev_state = self._engine.state.clone()
@@ -193,21 +235,61 @@ class BusEnv(gym.Env):
                     info,
                 )
 
-            # Action succeeded — advance automatic phases if needed
-            self._auto_advance()
+        elif head_id == HeadId.RESOLVE_VRROOMM_PASSENGER:
+            skip_idx = self._hier_action_mapping.action_to_index(
+                HeadId.RESOLVE_VRROOMM_PASSENGER, VRROOMM_SKIP
+            )
+            if action == skip_idx:
+                if self._resolver is not None:
+                    self._resolver.skip_vrroomm_deliveries()
+                self._skip_vrroomm()
+            else:
+                valid_passenger_ids = decision["valid_passenger_ids"]
+                passenger_id = self._hier_action_mapping.index_to_action(
+                    HeadId.RESOLVE_VRROOMM_PASSENGER, action
+                )
+                if passenger_id not in valid_passenger_ids:
+                    raise RuntimeError("Chosen passenger not in valid resolver actions")
+                self._select_vrroomm_passenger_with_tiebreak(
+                    int(passenger_id), valid_passenger_ids
+                )
 
-        # 4. Re-check terminal and truncation
+        elif head_id == HeadId.RESOLVE_VRROOMM_DEST:
+            valid_destinations = decision["valid_destinations"]
+            dest = self._hier_action_mapping.index_to_action(
+                HeadId.RESOLVE_VRROOMM_DEST, action
+            )
+            if dest not in valid_destinations:
+                raise RuntimeError("Chosen destination not in valid resolver actions")
+
+            if self._resolver is None:
+                raise RuntimeError("Resolver missing during Vrroomm destination selection")
+
+            to_node, slot_idx = dest
+            delivery_action = self._build_vrroomm_delivery_action(to_node, slot_idx)
+            action_info["delivery"] = delivery_action
+            self._resolver.apply_action(delivery_action)
+
+        else:
+            if self._resolver is None:
+                raise RuntimeError("Resolver missing during resolution action")
+            if action not in decision["valid_index_to_action"]:
+                raise RuntimeError("Chosen action not in valid action mapping")
+            action_dict = decision["valid_index_to_action"][action]
+            self._resolver.apply_action(action_dict)
+
+        # Clear decision cache after applying action
+        self._decision_cache = None
+
+        # Advance automatic phases
+        self._advance_after_action()
+
+        # Re-check terminal and truncation
         terminated = self._engine.is_game_over()
         truncated = self._step_count >= self._max_steps
-        decision_made = not action_obj.params.get("noop", False) and step_result.success
-        if decision_made:
-            self._active_step_count += 1
+        self._active_step_count += 1
 
-        #print(f"[DEBUG] Step {self._step_count}, phase={self._engine.state.phase}, decision_made={decision_made}, terminated={terminated}")
-
-
-        # 5. Compute reward
-        action_info = {"action_type": action_obj.action_type.value}
+        # Compute reward
         reward = self._reward_calculator.compute_reward(
             state=self._engine.state,
             prev_state=prev_state,
@@ -216,14 +298,14 @@ class BusEnv(gym.Env):
             action_info=action_info,
         )
 
-        # 6. Update previous state
+        # Update previous state
         self._prev_state = self._engine.state.clone()
         self._current_player_at_step = self._engine.state.global_state.current_player_idx
 
-        # 7. Observation
+        # Observation
         obs = self._get_observation()
 
-        # 8. Merge info
+        # Merge info
         new_info = self._get_info()
         info.update(new_info)
         info["acting_player"] = acting_player
@@ -233,20 +315,8 @@ class BusEnv(gym.Env):
 
         if terminated or truncated:
             self._episode_lengths.append(self._active_step_count)
-            self._active_step_count = 0  # reset for next episode
+            self._active_step_count = 0
             info["game_over"] = True
-            # print(
-            #     f"Step {self._step_count}, Active Step{self._active_step_count}, phase={self._engine.state.phase}, "
-            #     f"terminated={terminated}, truncated={truncated}, "
-            #     f"valid_actions={len(self._engine.get_valid_actions())}"
-            # )
-
-        # Debug print
-        # print(
-        #     f"Step {self._step_count}, phase={self._engine.state.phase}, "
-        #     f"terminated={terminated}, truncated={truncated}, "
-        #     f"valid_actions={len(self._engine.get_valid_actions())}"
-        # )
 
         return obs, float(reward), terminated, truncated, info
 
@@ -255,41 +325,8 @@ class BusEnv(gym.Env):
         """Auto-advance through phases that do not require player decisions."""
         if self._engine is None:
             return
-
-        max_iterations = 200  # Safety limit
-        for i in range(max_iterations):
-            if self._engine.is_game_over():
-                #print(f"_auto_advance: game over reached at iteration {i}")
-                break
-
-            phase = self._engine.state.phase
-            valid_actions = self._engine.get_valid_actions()
-
-            # 1. RESOLVING_ACTIONS -> fully auto-resolve
-            if phase == Phase.RESOLVING_ACTIONS:
-                # print(f"_auto_advance: resolving actions at iteration {i}")
-                self._auto_resolve_actions()
-                # Count this as a step
-                self._step_count += 1
-                continue  # stay in loop until phase changes or game over
-
-            # 2. CLEANUP or other automatic phases
-            if phase == Phase.CLEANUP:
-                result = self._engine.resolve_cleanup()
-                self._step_count += 1
-                if not result.success:
-                    print(f"_auto_advance: cleanup failed at iteration {i}")
-                    break
-                continue
-
-            # 3. Player must act
-            if len(valid_actions) > 0:
-                #print(f"_auto_advance: stopping at player choice at iteration {i}")
-                break
-
-            # 4. No valid actions and not a resolvable phase -> likely stuck
-            #print(f"_auto_advance: no valid actions, stopping at iteration {i}")
-            break
+        if self._engine.state.phase == Phase.CLEANUP:
+            self._engine.resolve_cleanup()
 
 
     def _auto_resolve_actions(self) -> None:
@@ -313,40 +350,195 @@ class BusEnv(gym.Env):
         # Manually trigger phase check to transition to CLEANUP
         self._engine._check_phase_transition()
 
+    # -------------------------------------------------------------------------
+    # Hierarchical resolution helpers
+    # -------------------------------------------------------------------------
+
+    def _sync_resolution_state(self) -> None:
+        """Sync resolver context into GlobalState for phase transitions."""
+        if self._engine is None or self._resolver is None:
+            return
+        ctx = self._resolver.get_context()
+        if ctx.current_area is None:
+            # Resolution complete
+            self._engine.state.global_state.current_resolution_area_idx = len(
+                ACTION_RESOLUTION_ORDER
+            )
+            self._engine.state.global_state.current_resolution_slot_idx = 0
+            return
+
+        self._engine.state.global_state.current_resolution_area_idx = ctx.current_area_idx
+        self._engine.state.global_state.current_resolution_slot_idx = ctx.current_slot_idx
+        if ctx.awaiting_player_id is not None:
+            self._engine.state.global_state.current_player_idx = ctx.awaiting_player_id
+
+    def _ensure_resolver(self) -> Optional[ActionResolver]:
+        if self._engine is None:
+            return None
+        if self._engine.state.phase != Phase.RESOLVING_ACTIONS:
+            self._resolver = None
+            self._vrroomm_stage_state.complete()
+            return None
+        if self._resolver is None:
+            self._resolver = ActionResolver(self._engine.state)
+            self._resolver.start_resolution()
+            self._sync_resolution_state()
+        return self._resolver
+
+    def _advance_resolver_until_input(self) -> Optional["ResolutionContext"]:
+        resolver = self._ensure_resolver()
+        if resolver is None:
+            return None
+
+        while True:
+            ctx = resolver.get_context()
+            self._sync_resolution_state()
+
+            if ctx.status == ResolutionStatus.AWAITING_INPUT:
+                if ctx.current_area == ActionAreaType.VRROOMM:
+                    if self._vrroomm_stage_state.stage == 0:
+                        self._enter_vrroomm()
+                else:
+                    self._vrroomm_stage_state.complete()
+                return ctx
+
+            if ctx.status == ResolutionStatus.ALL_COMPLETE:
+                self._vrroomm_stage_state.complete()
+                # Ensure phase transition to CLEANUP
+                self._engine._check_phase_transition()
+                return ctx
+
+            resolver.advance()
+
+    def _advance_after_action(self) -> None:
+        if self._engine is None:
+            return
+        if self._engine.state.phase == Phase.RESOLVING_ACTIONS:
+            self._advance_resolver_until_input()
+        if self._engine.state.phase == Phase.CLEANUP:
+            self._engine.resolve_cleanup()
+
+    def _build_mask(
+        self, head_id: HeadId, valid_actions: list[Any]
+    ) -> tuple[np.ndarray, dict[int, Any]]:
+        """Build a mask and index mapping from valid actions for a head."""
+        mask = np.zeros(self._max_head_actions, dtype=np.bool_)
+        valid_index_to_action: dict[int, Any] = {}
+        for action in valid_actions:
+            idx = self._hier_action_mapping.action_to_index(head_id, action)
+            mask[idx] = True
+            valid_index_to_action[idx] = action
+        return mask, valid_index_to_action
+
+    def _get_decision_context(self, _retry: bool = False) -> Optional[dict[str, Any]]:
+        """Compute and cache current decision context."""
+        if self._decision_cache is not None:
+            return self._decision_cache
+
+        if self._engine is None:
+            return None
+
+        phase = self._engine.state.phase
+        resolver_ctx = None
+        resolution_area = None
+        valid_actions: list[Any] = []
+
+        if phase == Phase.RESOLVING_ACTIONS:
+            resolver_ctx = self._advance_resolver_until_input()
+            if resolver_ctx is None:
+                return None
+            resolution_area = resolver_ctx.current_area
+            if resolver_ctx.status == ResolutionStatus.ALL_COMPLETE:
+                self._decision_cache = {"head_id": None, "mask": None}
+                return self._decision_cache
+            valid_actions = list(resolver_ctx.valid_actions)
+        else:
+            valid_actions = list(self._engine.get_valid_actions())
+
+        head_id = get_head_id(
+            phase, resolution_area, self._vrroomm_stage_state.stage
+        )
+        if head_id is None:
+            self._decision_cache = {"head_id": None, "mask": None}
+            return self._decision_cache
+
+        mask = np.zeros(self._max_head_actions, dtype=np.bool_)
+        valid_index_to_action: dict[int, Any] = {}
+        valid_passenger_ids: set[int] = set()
+        valid_destinations: set[tuple[int, int]] = set()
+
+        if head_id == HeadId.RESOLVE_VRROOMM_PASSENGER:
+            valid_passenger_ids = {
+                int(a["passenger_id"]) for a in valid_actions if "passenger_id" in a
+            }
+            for passenger_id in valid_passenger_ids:
+                idx = self._hier_action_mapping.action_to_index(
+                    HeadId.RESOLVE_VRROOMM_PASSENGER, passenger_id
+                )
+                mask[idx] = True
+            skip_idx = self._hier_action_mapping.action_to_index(
+                HeadId.RESOLVE_VRROOMM_PASSENGER, VRROOMM_SKIP
+            )
+            mask[skip_idx] = True
+
+        elif head_id == HeadId.RESOLVE_VRROOMM_DEST:
+            selected_id = self._vrroomm_stage_state.selected_passenger_id
+            if selected_id is not None:
+                valid_destinations = {
+                    (int(a["to_node"]), int(a["building_slot_index"]))
+                    for a in valid_actions
+                    if int(a["passenger_id"]) == selected_id
+                }
+            for dest in valid_destinations:
+                idx = self._hier_action_mapping.action_to_index(
+                    HeadId.RESOLVE_VRROOMM_DEST, dest
+                )
+                mask[idx] = True
+
+        else:
+            mask, valid_index_to_action = self._build_mask(head_id, valid_actions)
+
+        if mask.sum() > self._hier_action_mapping.head_size(head_id):
+            raise RuntimeError("Mask leakage: mask.sum() exceeds head size")
+        if not mask.any():
+            if phase == Phase.RESOLVING_ACTIONS and not _retry:
+                self._decision_cache = None
+                self._advance_resolver_until_input()
+                return self._get_decision_context(_retry=True)
+            raise RuntimeError("Empty action mask in decision phase")
+
+        self._decision_cache = {
+            "head_id": head_id,
+            "mask": mask,
+            "valid_actions": valid_actions,
+            "valid_index_to_action": valid_index_to_action,
+            "valid_passenger_ids": valid_passenger_ids,
+            "valid_destinations": valid_destinations,
+        }
+        return self._decision_cache
+
     def action_masks(self) -> np.ndarray:
-        """Get action mask for MaskablePPO.
+        """Get action mask for hierarchical PPO.
 
         Returns:
-            Boolean array of shape (total_actions,) where True = valid action.
+            Boolean array of shape (max_head_actions,) where True = valid action.
         """
         if self._engine is None:
-            # Return all-invalid mask if not initialized
-            #return np.zeros(self._action_config.total_actions, dtype=np.bool_)
-            mask = np.zeros(self._action_config.total_actions, dtype=np.bool_)
-            mask[self._action_config.noop_idx] = True
+            mask = np.zeros(self._max_head_actions, dtype=np.bool_)
+            mask[0] = True
             return mask
 
-        valid_actions = self._engine.get_valid_actions()
-        if len(valid_actions) == 0:
-            # Auto-advance phases may legitimately yield no actions for this player.
-            if self._engine.is_game_over() or self._engine.state.phase in (
-                Phase.RESOLVING_ACTIONS,
-                Phase.CLEANUP,
-            ):
-                mask = np.zeros(self._action_config.total_actions, dtype=np.bool_)
-                mask[self._action_config.noop_idx] = True
-                return mask
-            raise RuntimeError(
-                "No valid actions in a decision phase. "
-                "This indicates a game engine or masking bug."
-            )
+        decision = self._get_decision_context()
+        if decision is None or decision.get("mask") is None:
+            mask = np.zeros(self._max_head_actions, dtype=np.bool_)
+            mask[0] = True
+            return mask
 
-        action_mask = self._mask_generator.generate_mask(self._engine.state, valid_actions)
-        if not np.any(action_mask):
-            raise RuntimeError("EMPTY ACTION MASK — THIS WILL CRASH PPO")
-
+        action_mask = decision["mask"]
         if np.any(np.isnan(action_mask)):
             raise RuntimeError("NaN IN MASK")
+        if not np.any(action_mask):
+            raise RuntimeError("EMPTY ACTION MASK — THIS WILL CRASH PPO")
 
         return action_mask
 
@@ -357,7 +549,14 @@ class BusEnv(gym.Env):
             return np.zeros(self._obs_config.total_observation_dim, dtype=np.float32)
 
         current_player = self._engine.state.global_state.current_player_idx
-        return self._obs_encoder.encode(self._engine.state, current_player)
+        decision = self._get_decision_context()
+        head_id = decision.get("head_id") if decision else None
+        return self._obs_encoder.encode(
+            self._engine.state,
+            current_player,
+            head_id=head_id,
+            vrroomm_stage=self._vrroomm_stage_state.stage,
+        )
 
     def _get_info(self) -> dict[str, Any]:
         """Get info dictionary with game metadata."""
@@ -365,13 +564,19 @@ class BusEnv(gym.Env):
             return {}
 
         state = self._engine.state
-        mask = self.action_masks()
+        decision = self._get_decision_context()
+        mask = decision["mask"] if decision and decision.get("mask") is not None else None
+        valid_action_count = int(np.sum(mask)) if mask is not None else 0
+        head_id = decision.get("head_id") if decision else None
 
         return {
             "phase": state.phase.value,
             "round": state.global_state.round_number,
             "current_player": state.global_state.current_player_idx,
-            "valid_action_count": int(np.sum(mask)),
+            "valid_action_count": valid_action_count,
+            "head_id": head_id.value if isinstance(head_id, HeadId) else None,
+            "head_name": head_id.name if isinstance(head_id, HeadId) else None,
+            "vrroomm_stage": self._vrroomm_stage_state.stage,
             "scores": {p.player_id: p.score for p in state.players},
             "time_stones": {p.player_id: p.time_stones for p in state.players},
             "buses": {p.player_id: p.buses for p in state.players},
@@ -419,6 +624,71 @@ class BusEnv(gym.Env):
         if self._engine is None:
             return 0
         return self._engine.state.global_state.current_player_idx
+
+    # -------------------------------------------------------------------------
+    # Vrroomm two-stage helpers (hierarchical action flow)
+    # -------------------------------------------------------------------------
+
+    def get_vrroomm_stage(self) -> int:
+        """Get current Vrroomm stage (0=none, 1=passenger, 2=destination)."""
+        return self._vrroomm_stage_state.stage
+
+    def _enter_vrroomm(self) -> None:
+        self._vrroomm_stage_state.enter()
+
+    def _select_vrroomm_passenger(self, passenger_id: int) -> None:
+        self._vrroomm_stage_state.select_passenger(passenger_id)
+
+    def _select_vrroomm_passenger_with_tiebreak(
+        self, passenger_id: int, valid_passenger_ids: Optional[set[int]] = None
+    ) -> int:
+        """Select a passenger with origin-based tie-break.
+
+        If multiple passengers are at the same origin, choose the lowest
+        passenger_id at that origin to keep selection deterministic.
+        """
+        if self._engine is None:
+            raise RuntimeError("Environment not initialized. Call reset() first.")
+
+        passenger = self._engine.state.passenger_manager.get_passenger(int(passenger_id))
+        if passenger is None:
+            raise ValueError(f"Passenger {passenger_id} not found")
+
+        origin = passenger.location
+        passengers_at_origin = self._engine.state.passenger_manager.get_passengers_at(origin)
+        if not passengers_at_origin:
+            raise ValueError(f"No passengers at origin {origin}")
+
+        if valid_passenger_ids is not None and passenger_id not in valid_passenger_ids:
+            raise ValueError("Passenger not in resolver-valid list")
+
+        candidate_ids = [p.passenger_id for p in passengers_at_origin]
+        if valid_passenger_ids is not None:
+            candidate_ids = [pid for pid in candidate_ids if pid in valid_passenger_ids]
+
+        if not candidate_ids:
+            raise ValueError("No resolver-valid passengers at origin")
+
+        chosen_id = min(candidate_ids)
+        self._select_vrroomm_passenger(chosen_id)
+        return chosen_id
+
+    def _build_vrroomm_delivery_action(
+        self,
+        to_node: int,
+        building_slot_index: int,
+    ) -> dict:
+        if self._engine is None:
+            raise RuntimeError("Environment not initialized. Call reset() first.")
+        return self._vrroomm_stage_state.build_delivery_action(
+            self._engine.state, to_node, building_slot_index
+        )
+
+    def _complete_vrroomm(self) -> None:
+        self._vrroomm_stage_state.complete()
+
+    def _skip_vrroomm(self) -> None:
+        self._vrroomm_stage_state.skip()
 
     def clone(self) -> "BusEnv":
         """Create a deep copy of the environment.

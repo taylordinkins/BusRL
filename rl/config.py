@@ -53,6 +53,8 @@ class ObservationConfig:
     BUILDING_TYPES: int = 4  # none, house, office, pub
     PHASES: int = 7  # All Phase enum values
     TIME_CLOCK_POSITIONS: int = 3  # house, office, pub
+    HEAD_ID_DIM: int = 10  # hierarchical policy head id (one-hot)
+    VRROOMM_STAGE_DIM: int = 2  # stage 1/2 (one-hot, zeros outside vrroomm)
 
     # Action board dimensions
     ACTION_AREAS: int = 7
@@ -64,7 +66,7 @@ class ObservationConfig:
     PLAYER_FEATURE_DIM: ClassVar[int] = 10
     SLOT_FEATURE_DIM: ClassVar[int] = 4
     PASSENGER_FEATURE_DIM: ClassVar[int] = 5
-    GLOBAL_FEATURE_DIM: ClassVar[int] = 27
+    GLOBAL_FEATURE_DIM: ClassVar[int] = 27 + 10 + 2  # base + head_id + vrroomm_stage
 
     @property
     def node_features_size(self) -> int:

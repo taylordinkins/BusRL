@@ -43,7 +43,9 @@ from rl.callbacks import (
     MultiPolicyTrainingCallback,
     TrueEpisodeLengthCallback,
     DiagnosticMaskingCallback,
+    HeadUsageCallback,
 )
+from rl.policies import BusMaskableActorCriticPolicy
 
 #########
 # UNSURE IF THIS IS ACTUALLY TRUE
@@ -365,6 +367,9 @@ def train(args):
     true_ep_len_callback = TrueEpisodeLengthCallback()
     callbacks.append(true_ep_len_callback)
 
+    head_usage_callback = HeadUsageCallback()
+    callbacks.append(head_usage_callback)
+
     # Entropy decay callback
     if args.ent_coef_final < args.ent_coef:
         entropy_callback = EntropyDecayCallback(
@@ -416,8 +421,13 @@ def train(args):
             callbacks.append(multi_policy_callback)
 
     # Initialize model
+    policy_kwargs = {
+        "logit_clamp": args.logit_clamp,
+        "logit_clamp_min": args.logit_clamp_min,
+        "logit_clamp_max": args.logit_clamp_max,
+    }
     model = MaskablePPO(
-        MaskableActorCriticPolicy, #"MlpPolicy",
+        BusMaskableActorCriticPolicy, #"MlpPolicy",
         env,
         verbose=1,
         learning_rate=args.lr,
@@ -431,6 +441,7 @@ def train(args):
         target_kl=args.target_kl,
         tensorboard_log="logs",
         device=args.device,
+        policy_kwargs=policy_kwargs,
     )
     # Load initial checkpoint if provided
     if args.initial_checkpoint:
@@ -465,6 +476,10 @@ def train(args):
             args.initial_checkpoint,
             env=env,       # important to pass the current env
             device=args.device,
+            custom_objects={
+                "policy_class": BusMaskableActorCriticPolicy,
+                "policy_kwargs": policy_kwargs,
+            },
         )
 
 
@@ -586,6 +601,12 @@ if __name__ == "__main__":
                         help="Tolerance for probs sum deviation before counting as bad")
     parser.add_argument("--log_self_play_checkpoint", action="store_true",
                         help="Log when subprocesses reload self-play checkpoints")
+    parser.add_argument("--no-logit-clamp", action="store_true",
+                        help="Disable logit clamping (enabled by default)")
+    parser.add_argument("--logit_clamp_min", type=float, default=-20.0,
+                        help="Minimum logit clamp value (when --logit_clamp enabled)")
+    parser.add_argument("--logit_clamp_max", type=float, default=20.0,
+                        help="Maximum logit clamp value (when --logit_clamp enabled)")
 
     # Opponent pool args
     parser.add_argument("--use_opponent_pool", action="store_true",
@@ -641,6 +662,7 @@ if __name__ == "__main__":
                         help="Elo K-factor (higher = more volatile ratings)")
 
     args = parser.parse_args()
+    args.logit_clamp = not args.no_logit_clamp
 
     # Validate args
     if args.multi_policy and not args.use_opponent_pool:

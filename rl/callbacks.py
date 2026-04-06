@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 import multiprocessing
 
 from rl.bus_env import BusEnv
+from rl.hierarchical_action_space import HeadId
 
 
 class OpponentPoolCallback(BaseCallback):
@@ -833,3 +834,71 @@ class TrueEpisodeLengthCallback(BaseCallback):
                     self.logger.record("rollout/ep_len_true", ep_len)
 
         return True
+
+
+class HeadUsageCallback(BaseCallback):
+    """Log per-head usage counts to TensorBoard."""
+
+    def __init__(self, log_interval_steps: int = 0, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_interval_steps = max(0, int(log_interval_steps))
+        self._counts = {head: 0 for head in HeadId}
+        self._last_log_step = 0
+        self._label_map = {
+            HeadId.SETUP_BUILDINGS: "setup_bld",
+            HeadId.SETUP_RAILS_FORWARD: "setup_rf",
+            HeadId.SETUP_RAILS_REVERSE: "setup_rr",
+            HeadId.CHOOSING_ACTIONS: "choose",
+            HeadId.RESOLVE_LINE_EXPANSION: "lineexp",
+            HeadId.RESOLVE_PASSENGERS: "passeng",
+            HeadId.RESOLVE_BUILDINGS: "build",
+            HeadId.RESOLVE_TIME_CLOCK: "clock",
+            HeadId.RESOLVE_VRROOMM_PASSENGER: "vr_pax",
+            HeadId.RESOLVE_VRROOMM_DEST: "vr_dst",
+        }
+
+    def _on_training_start(self) -> None:
+        labels = ", ".join(
+            f"h{head.value}={self._label_map.get(head, head.name)}"
+            for head in HeadId
+        )
+        print(f"Head usage labels: {labels}")
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos")
+        if infos:
+            for info in infos:
+                head_id = info.get("head_id")
+                if head_id is None:
+                    continue
+                if isinstance(head_id, str):
+                    try:
+                        head_id = HeadId[head_id]
+                    except KeyError:
+                        continue
+                elif isinstance(head_id, int):
+                    try:
+                        head_id = HeadId(head_id)
+                    except ValueError:
+                        continue
+                if isinstance(head_id, HeadId):
+                    self._counts[head_id] += 1
+        return True
+
+    def _on_rollout_end(self) -> None:
+        if self.logger is None:
+            return
+        if self.log_interval_steps and (self.num_timesteps - self._last_log_step < self.log_interval_steps):
+            return
+        self._last_log_step = self.num_timesteps
+
+        total = sum(self._counts.values())
+        for head, count in self._counts.items():
+            short = f"h{head.value}"
+            label = self._label_map.get(head, head.name)
+            key = f"{short}_{label}"
+            self.logger.record(f"rollout/head_usage/{key}", count)
+            if total > 0:
+                self.logger.record(f"rollout/head_usage_pct/{key}", count / total)
+
+        self._counts = {head: 0 for head in HeadId}

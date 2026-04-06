@@ -25,6 +25,7 @@ import numpy as np
 if TYPE_CHECKING:
     from sb3_contrib import MaskablePPO
     from .elo_tracker import EloTracker
+from .policies import BusMaskableActorCriticPolicy
 
 
 @dataclass
@@ -215,7 +216,18 @@ class OpponentPool:
         if not path.endswith(".zip"):
             path = path + ".zip"
 
-        loaded = MaskablePPO.load(path, device="cpu")
+        loaded = MaskablePPO.load(
+            path,
+            device="cpu",
+            custom_objects={
+                "policy_class": BusMaskableActorCriticPolicy,
+                "policy_kwargs": {
+                    "logit_clamp": True,
+                    "logit_clamp_min": -20.0,
+                    "logit_clamp_max": 20.0,
+                },
+            },
+        )
 
         # Explicitly freeze for inference only
         # This disables dropout, batch norm updates, etc.
