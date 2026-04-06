@@ -48,6 +48,7 @@ class CheckpointInfo:
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     win_rate_vs_current: float = 0.5
     games_played: int = 0
+    sigma: Optional[float] = None
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -109,6 +110,8 @@ class OpponentPool:
         self.checkpoints: list[CheckpointInfo] = []
         self._current_policy: Optional[MaskablePPO] = None
         self._elo_tracker: Optional["EloTracker"] = elo_tracker
+        self._current_mu: Optional[float] = None
+        self._current_sigma: Optional[float] = None
 
         # Create save directory
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -145,6 +148,7 @@ class OpponentPool:
         model: "MaskablePPO",
         step: int,
         elo: Optional[float] = None,
+        sigma: Optional[float] = None,
         metadata: Optional[dict] = None,
     ) -> CheckpointInfo:
         """Save the current policy as a new checkpoint.
@@ -171,6 +175,7 @@ class OpponentPool:
             path=str(checkpoint_path) + ".zip",  # SB3 adds .zip extension
             step=step,
             elo=elo if elo is not None else self.config.initial_elo,
+            sigma=sigma,
             metadata=metadata or {},
         )
 
@@ -265,6 +270,11 @@ class OpponentPool:
                 weights = [self._pfsp_weight(
                     self._elo_tracker.expected_win_probability("__current__", c.checkpoint_id)
                 ) for c in candidates]
+            elif self._current_mu is not None and self._current_sigma is not None:
+                weights = [
+                    self._pfsp_weight(self._expected_win_probability_from_pool(c))
+                    for c in candidates
+                ]
             else:
                 weights = [self._pfsp_weight(c.win_rate_vs_current) for c in candidates]
             total = sum(weights)
@@ -316,11 +326,53 @@ class OpponentPool:
                     exclude_ids.add(opponent.checkpoint_id)
             return sampled
 
+    def sample_opponents_temperature_weighted(
+        self,
+        n: int,
+        temperature: float,
+        tracker,
+    ) -> list[CheckpointInfo]:
+        """Sample n opponents without replacement using temperature-scaled softmax.
+
+        weight_i = exp(rating_i / temperature)  (numerically stabilised by
+        subtracting the max before exponentiating).
+
+        Args:
+            n: Number of opponents to sample.
+            temperature: Softmax temperature.  Higher T → more uniform;
+                lower T → stronger bias toward high-rated opponents.
+            tracker: An EloTracker or OpenSkillTracker (duck-typed —
+                only get_rating() is called).
+
+        Returns:
+            List of up to n CheckpointInfo objects (fewer if pool is smaller).
+        """
+        import math
+
+        candidates = list(self.checkpoints)
+        if not candidates:
+            return []
+        n = min(n, len(candidates))
+
+        sampled: list[CheckpointInfo] = []
+        for _ in range(n):
+            if not candidates:
+                break
+            ratings = [tracker.get_rating(c.checkpoint_id) for c in candidates]
+            scaled = [r / temperature for r in ratings]
+            max_s = max(scaled)
+            weights = [math.exp(s - max_s) for s in scaled]
+            chosen = random.choices(candidates, weights=weights, k=1)[0]
+            sampled.append(chosen)
+            candidates.remove(chosen)
+        return sampled
+
     def update_checkpoint_stats(
         self,
         checkpoint_id: str,
         win_rate: Optional[float] = None,
         elo: Optional[float] = None,
+        sigma: Optional[float] = None,
         games_played_delta: int = 0,
     ) -> None:
         """Update statistics for a checkpoint.
@@ -340,6 +392,8 @@ class OpponentPool:
                     # Also update in Elo tracker if available
                     if self._elo_tracker is not None:
                         self._elo_tracker.set_rating(checkpoint_id, elo)
+                if sigma is not None:
+                    checkpoint.sigma = sigma
                 checkpoint.games_played += games_played_delta
                 break
 
@@ -358,6 +412,13 @@ class OpponentPool:
             new_elo = self._elo_tracker.get_rating(checkpoint.checkpoint_id)
             if new_elo != checkpoint.elo:
                 checkpoint.elo = new_elo
+            if hasattr(self._elo_tracker, "get_sigma"):
+                checkpoint.sigma = self._elo_tracker.get_sigma(checkpoint.checkpoint_id)
+
+        if hasattr(self._elo_tracker, "get_rating"):
+            self._current_mu = self._elo_tracker.get_rating("__current__")
+            if hasattr(self._elo_tracker, "get_sigma"):
+                self._current_sigma = self._elo_tracker.get_sigma("__current__")
 
         self._save_pool_state()
 
@@ -422,14 +483,6 @@ class OpponentPool:
             return 0.0
         elos = [c.elo for c in self.checkpoints]
         return max(elos) - min(elos)
-
-    def refresh(self) -> None:
-        """Refresh pool state from disk.
-        
-        This is used by subprocess environments to pick up new checkpoints
-        saved by the main training process. Reloads the pool_state.json file.
-        """
-        self._load_pool_state()
 
     def __len__(self) -> int:
         """Number of checkpoints in the pool."""
@@ -510,6 +563,7 @@ class OpponentPool:
                 path=str(dst_path),
                 step=ckpt.step,
                 elo=ckpt.elo,
+                sigma=getattr(ckpt, "sigma", None),
                 created_at=ckpt.created_at,
                 win_rate_vs_current=0.5,
                 games_played=0,
@@ -538,6 +592,17 @@ class OpponentPool:
         """
         # f(x) = x(1-x) peaks at 0.5
         return win_rate * (1 - win_rate) + 0.1  # Small epsilon for exploration
+
+    def _expected_win_probability_from_pool(self, opponent: CheckpointInfo) -> float:
+        """Bradley-Terry win probability using mu/sigma stored in pool_state."""
+        if self._current_mu is None or self._current_sigma is None:
+            return 0.5
+        if opponent.sigma is None:
+            return 0.5
+        denom = (self._current_sigma ** 2 + opponent.sigma ** 2) ** 0.5
+        if denom == 0.0:
+            return 0.5
+        return 1.0 / (1.0 + np.exp(-(self._current_mu - opponent.elo) / denom))
 
     def _prune_pool(self) -> None:
         """Remove checkpoints to maintain pool size."""
@@ -607,10 +672,19 @@ class OpponentPool:
             pass  # Ignore file removal errors
 
     def _save_pool_state(self) -> None:
-        """Save pool state to disk."""
+        """Save pool state to disk atomically (write-tmp + rename).
+
+        Prevents subprocess workers on NFS from reading a truncated file
+        between the open("w") truncate and the json.dump completion.
+        """
         state_path = self.save_dir / "pool_state.json"
+        tmp_path = state_path.with_suffix(".json.tmp")
         state = {
             "checkpoints": [c.to_dict() for c in self.checkpoints],
+            "current": {
+                "mu": self._current_mu,
+                "sigma": self._current_sigma,
+            },
             "config": {
                 "pool_size": self.config.pool_size,
                 "save_interval": self.config.save_interval,
@@ -619,8 +693,11 @@ class OpponentPool:
                 "prune_strategy": self.config.prune_strategy,
             },
         }
-        with open(state_path, "w") as f:
+        with open(tmp_path, "w") as f:
             json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, state_path)
 
     def _load_pool_state(self) -> None:
         """Load pool state from disk."""
@@ -635,6 +712,9 @@ class OpponentPool:
             self.checkpoints = [
                 CheckpointInfo.from_dict(c) for c in state.get("checkpoints", [])
             ]
+            current = state.get("current", {})
+            self._current_mu = current.get("mu")
+            self._current_sigma = current.get("sigma")
 
             # Validate checkpoint files still exist
             valid_checkpoints = []
@@ -656,3 +736,10 @@ class OpponentPool:
         the main training process.
         """
         self._load_pool_state()
+        if self._elo_tracker is not None:
+            # Reload tracker state if supported (e.g., OpenSkill read-only)
+            if hasattr(self._elo_tracker, "reload_state"):
+                self._elo_tracker.reload_state()
+            # Ensure all checkpoints are registered with tracker
+            for checkpoint in self.checkpoints:
+                self._elo_tracker.register_checkpoint(checkpoint.checkpoint_id, checkpoint.elo)

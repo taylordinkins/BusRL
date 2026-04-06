@@ -81,6 +81,36 @@ class EntropyDecayCallback(BaseCallback):
         return True
 
 
+def _save_model_atomic(model, target_path: str) -> None:
+    """Atomically save an SB3 model by writing a temp file then renaming."""
+    import tempfile
+
+    target_path = str(target_path)
+    if target_path.endswith(".zip"):
+        final_path = target_path
+    else:
+        final_path = target_path + ".zip"
+
+    directory = os.path.dirname(final_path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".self_play_", suffix=".zip", dir=directory)
+    os.close(fd)
+    saved_path = tmp_path
+    try:
+        model.save(tmp_path)
+        if not os.path.exists(saved_path) and os.path.exists(tmp_path + ".zip"):
+            saved_path = tmp_path + ".zip"
+        os.replace(saved_path, final_path)
+    finally:
+        for path in (tmp_path, tmp_path + ".zip"):
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+
+
 def train(args):
     """Run training for the Bus RL agent."""
     if args.disable_dist_validate:
@@ -112,12 +142,23 @@ def train(args):
             pool_dir = os.path.join(log_dir, "opponent_pool")
             print(f"Creating new opponent pool at: {pool_dir}")
 
-        # Create Elo tracker (will load existing state if present)
-        elo_tracker = EloTracker(
-            k_factor=args.elo_k_factor,
-            initial_elo=1500.0,
-            save_path=os.path.join(pool_dir, "elo_state.json"),
-        )
+        # Create skill tracker (Elo or OpenSkill depending on --skill_tracking)
+        if args.skill_tracking == "openskill":
+            from rl.openskill_tracker import OpenSkillTracker
+            elo_tracker = OpenSkillTracker(
+                save_path=os.path.join(pool_dir, "openskill_state.json"),
+                initial_mu=1500.0,      # matches Elo baseline so primed checkpoints map cleanly
+                initial_sigma=433.0,    # 3-sigma ≈ 750 Elo-equivalent spread; decays with games
+                pl_tau=args.pl_tau,
+            )
+            print(f"  Skill tracking: OpenSkill (Plackett-Luce)")
+        else:
+            elo_tracker = EloTracker(
+                k_factor=args.elo_k_factor,
+                initial_elo=1500.0,
+                save_path=os.path.join(pool_dir, "elo_state.json"),
+            )
+            print(f"  Skill tracking: Elo (k_factor={args.elo_k_factor})")
 
         # Create opponent pool (will load existing checkpoints if present)
         opponent_pool = OpponentPool(
@@ -174,6 +215,9 @@ def train(args):
         _pool_size = args.pool_size
         _pool_save_interval = args.pool_save_interval
         _prune_strategy = args.prune_strategy
+        _skill_tracking = args.skill_tracking
+        _pl_tau = args.pl_tau
+        _log_self_play_checkpoint = args.log_self_play_checkpoint
 
         def _init():
             # Optimize multiprocessing: prevent CPU oversubscription
@@ -197,7 +241,7 @@ def train(args):
                     subprocess_pool = OpponentPool(
                         save_dir=_pool_dir,
                         config=subprocess_pool_config,
-                        elo_tracker=None,  # Subprocesses don't track Elo
+                        elo_tracker=None,  # Subprocesses use pool_state for sampling
                     )
                     env = MultiPolicyBusEnv(
                         env,
@@ -205,9 +249,11 @@ def train(args):
                         training_slot=0,
                         self_play_prob=_self_play_prob,
                         sampling_method=_sampling_method,
-                        elo_tracker=None,  # Subprocesses don't track Elo
+                        elo_tracker=None,  # Subprocesses don't update ratings
                         randomize_training_slot=_randomize_training_slot,
                         self_play_checkpoint_path=self_play_checkpoint,
+                        refresh_every_n_episodes=5,
+                        log_self_play_checkpoint=_log_self_play_checkpoint,
                     )
                 else:
                     # For DummyVecEnv: use the main process's OpponentPool
@@ -220,6 +266,7 @@ def train(args):
                         elo_tracker=elo_tracker,
                         randomize_training_slot=_randomize_training_slot,
                         self_play_checkpoint_path=self_play_checkpoint,
+                        log_self_play_checkpoint=_log_self_play_checkpoint,
                     )
             else:
                 env = BusEnvSelfPlayWrapper(env)
@@ -315,7 +362,7 @@ def train(args):
         )
         callbacks.append(diag_callback)
 
-    true_ep_len_callback = TrueEpisodeLengthCallback(env)
+    true_ep_len_callback = TrueEpisodeLengthCallback()
     callbacks.append(true_ep_len_callback)
 
     # Entropy decay callback
@@ -335,6 +382,8 @@ def train(args):
             opponent_pool=opponent_pool,
             save_interval=args.pool_save_interval,
             self_play_checkpoint_path=self_play_checkpoint_path,
+            min_games_for_live_elo=(max(5, args.pool_eval_games) if args.skill_tracking == "openskill" else 0),
+            recenter_interval_steps=(args.openskill_recenter_interval if args.skill_tracking == "openskill" else 0),
             verbose=1,
         )
         callbacks.append(pool_callback)
@@ -351,6 +400,8 @@ def train(args):
                 n_eval_games=args.pool_eval_games,
                 max_opponents=args.pool_eval_opponents,
                 best_model_save_path=os.path.join(log_dir, "best_pool_model"),
+                skill_tracking=args.skill_tracking,
+                skill_temperature=args.skill_temperature,
                 verbose=1,
             )
             callbacks.append(pool_eval_callback)
@@ -393,8 +444,12 @@ def train(args):
         if os.path.exists(_info_path):
             with open(_info_path) as f:
                 _info = json.load(f)
-            print(f"  Best pool model: win_rate={_info.get('win_rate', 0):.3f}, "
-                  f"elo={_info.get('elo', 0):.1f}, step={_info.get('step', 0)}")
+            if _info.get("skill_tracking") == "openskill":
+                print(f"  Best pool model: win_rate={_info.get('win_rate', 0):.3f}, "
+                      f"mu={_info.get('mu', 0):.1f}, step={_info.get('step', 0)}")
+            else:
+                print(f"  Best pool model: win_rate={_info.get('win_rate', 0):.3f}, "
+                      f"elo={_info.get('elo', 0):.1f}, step={_info.get('step', 0)}")
         elif os.path.exists(_pool_state_path):
             with open(_pool_state_path) as f:
                 _pool_state = json.load(f)
@@ -439,7 +494,7 @@ def train(args):
         print(f"Saving initial self-play checkpoint to {self_play_checkpoint_path}...")
         # Ensure directory exists
         os.makedirs(os.path.dirname(self_play_checkpoint_path), exist_ok=True)
-        model.save(self_play_checkpoint_path)
+        _save_model_atomic(model, self_play_checkpoint_path)
 
     print(f"\nStarting training for {args.total_timesteps} steps...")
     print(f"Logs and models will be saved to: {log_dir}")
@@ -462,17 +517,18 @@ def train(args):
 
     # Print opponent pool summary if used
     if opponent_pool is not None:
+        rating_label = "mu" if args.skill_tracking == "openskill" else "Elo"
         print(f"\nOpponent Pool Summary:")
         print(f"  Total checkpoints: {len(opponent_pool)}")
-        print(f"  Best Elo: {opponent_pool.best_elo():.1f}")
-        print(f"  Elo spread: {opponent_pool.elo_spread():.1f}")
+        print(f"  Best {rating_label}: {opponent_pool.best_elo():.1f}")
+        print(f"  {rating_label} spread: {opponent_pool.elo_spread():.1f}")
 
         if elo_tracker is not None:
             leaderboard = elo_tracker.get_leaderboard(top_n=5)
             if leaderboard:
-                print(f"\nTop 5 checkpoints by Elo:")
-                for checkpoint_id, elo in leaderboard:
-                    print(f"  {checkpoint_id}: {elo:.1f}")
+                print(f"\nTop 5 checkpoints by {rating_label}:")
+                for checkpoint_id, rating in leaderboard:
+                    print(f"  {checkpoint_id}: {rating:.1f}")
 
 
 if __name__ == "__main__":
@@ -528,6 +584,8 @@ if __name__ == "__main__":
                         help="Max samples per diagnostic interval")
     parser.add_argument("--diag_log_tolerance", type=float, default=5e-5,
                         help="Tolerance for probs sum deviation before counting as bad")
+    parser.add_argument("--log_self_play_checkpoint", action="store_true",
+                        help="Log when subprocesses reload self-play checkpoints")
 
     # Opponent pool args
     parser.add_argument("--use_opponent_pool", action="store_true",
@@ -538,7 +596,7 @@ if __name__ == "__main__":
                         help="Start a fresh opponent pool instead of saving into --load_pool_dir. Primes the new pool with top 3 by Elo + 2 random checkpoints from --load_pool_dir")
     parser.add_argument("--pool_size", type=int, default=20,
                         help="Max checkpoints in opponent pool")
-    parser.add_argument("--pool_save_interval", type=int, default=5000,
+    parser.add_argument("--pool_save_interval", type=int, default=10000,
                         help="Steps between pool checkpoint saves")
     parser.add_argument("--prune_strategy", type=str, default="oldest",
                         choices=["oldest", "lowest_elo", "least_diverse"],
@@ -565,7 +623,20 @@ if __name__ == "__main__":
     parser.add_argument("--pool_eval_opponents", type=int, default=5,
                         help="Max opponents to evaluate against per interval")
 
-    # Elo args
+    # Skill tracking args
+    parser.add_argument("--skill_tracking", type=str, default="elo",
+                        choices=["elo", "openskill"],
+                        help="Skill tracking backend. 'elo' = standard Elo (2-policy eval); "
+                             "'openskill' = Plackett-Luce (true 4-player eval with temperature sampling)")
+    parser.add_argument("--skill_temperature", type=float, default=3.0,
+                        help="Softmax temperature for opponent sampling in openskill eval mode. "
+                             "Higher T = more uniform; lower T = stronger bias toward high-rated opponents.")
+    parser.add_argument("--pl_tau", type=float, default=25.0,
+                        help="Default tau value for the PlackettLuce openskill model. Higher indicates more uncertainty in the rating")
+    parser.add_argument("--openskill_recenter_interval", type=int, default=1_000_000,
+                        help="Recenter OpenSkill mus every N training steps (0 to disable)")
+
+    # Elo args (only used when --skill_tracking elo)
     parser.add_argument("--elo_k_factor", type=float, default=32.0,
                         help="Elo K-factor (higher = more volatile ratings)")
 

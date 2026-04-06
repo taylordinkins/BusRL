@@ -14,6 +14,7 @@ Key features:
 from __future__ import annotations
 
 from typing import Optional, Tuple, Union, Any, Callable, TYPE_CHECKING
+from collections import OrderedDict
 import numpy as np
 
 try:
@@ -161,6 +162,9 @@ class MultiPolicyBusEnv(gym.Wrapper):
         elo_tracker: Optional["EloTracker"] = None,
         randomize_training_slot: bool = False,
         self_play_checkpoint_path: Optional[str] = None,
+        refresh_every_n_episodes: int = 5,
+        max_policy_cache_size: int = 8,
+        log_self_play_checkpoint: bool = False,
     ):
         """Initialize the multi-policy wrapper.
 
@@ -177,6 +181,10 @@ class MultiPolicyBusEnv(gym.Wrapper):
             self_play_checkpoint_path: Path to checkpoint for self-play opponents.
                 Required for SubprocVecEnv compatibility when self_play_prob > 0.
                 Each subprocess loads this checkpoint independently.
+            max_policy_cache_size: Maximum number of opponent policies to keep
+                in the in-process LRU cache. Set to 0 to disable caching.
+            log_self_play_checkpoint: If True, log when self-play checkpoints
+                are reloaded by subprocesses.
         """
         super().__init__(env)
 
@@ -188,14 +196,18 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self.elo_tracker = elo_tracker
         self.randomize_training_slot = randomize_training_slot
         self.self_play_checkpoint_path = self_play_checkpoint_path
+        self.refresh_every_n_episodes = max(1, int(refresh_every_n_episodes))
+        self._episodes_since_refresh = 0
+        self.max_policy_cache_size = max(0, int(max_policy_cache_size))
+        self.log_self_play_checkpoint = bool(log_self_play_checkpoint)
 
         # Policy assignments for each player slot
         self._policy_slots: list[PolicySlot] = []
         self._num_players = getattr(env, "num_players", 4)
 
-        # Policy cache to avoid reloading from disk
+        # Policy cache to avoid reloading from disk (LRU, bounded)
         # Key: checkpoint_id, Value: frozen MaskablePPO model
-        self._policy_cache: dict[str, "MaskablePPO"] = {}
+        self._policy_cache: "OrderedDict[str, MaskablePPO]" = OrderedDict()
         # Track modification time of self-play checkpoint to know when to reload
         self._self_play_mtime: float = 0.0
 
@@ -244,16 +256,19 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # We detect subprocess mode by checking for self_play_checkpoint_path
         # (only set in SubprocVecEnv mode) or elo_tracker being None.
         if self.opponent_pool is not None and self.elo_tracker is None:
-            self.opponent_pool.refresh()
+            self._episodes_since_refresh += 1
+            if self._episodes_since_refresh >= self.refresh_every_n_episodes:
+                self.opponent_pool.refresh()
+                self._episodes_since_refresh = 0
 
             # Invalidate cache entries for checkpoints that are no longer in the pool
             # This prevents memory leaks from pruned checkpoints
             valid_checkpoint_ids = {ckpt.checkpoint_id for ckpt in self.opponent_pool.checkpoints}
-            self._policy_cache = {
-                ckpt_id: policy
+            self._policy_cache = OrderedDict(
+                (ckpt_id, policy)
                 for ckpt_id, policy in self._policy_cache.items()
                 if ckpt_id in valid_checkpoint_ids
-            }
+            )
 
         # # Randomize training slot if enabled (learn to play from any position)
         # if self.randomize_training_slot:
@@ -276,10 +291,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # Assign policies to player slots
         self._assign_policies()
 
-        # Store checkpoint IDs for this episode (for Elo updates)
-        self._current_episode_checkpoints = [
-            slot.checkpoint_id for slot in self._policy_slots
-        ]
+        # Store checkpoint IDs for this episode in *seat order* (for Elo updates)
+        # _policy_slots is indexed by logical slot; map to env seat index.
+        self._current_episode_checkpoints = [None] * self._num_players
+        for logical_slot, slot in enumerate(self._policy_slots):
+            env_slot = self._seat_permutation[logical_slot]
+            self._current_episode_checkpoints[env_slot] = slot.checkpoint_id
 
         # If not training player's turn, advance to their turn
         obs, info = self._advance_to_training_turn(obs, info)
@@ -476,6 +493,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
                     # Update cache and mtime
                     self._self_play_checkpoint_policy = loaded
                     self._self_play_mtime = mtime
+                    if self.log_self_play_checkpoint:
+                        print(
+                            f"[MultiPolicyBusEnv] Reloaded self-play checkpoint from {path_with_ext} "
+                            f"(mtime={mtime})",
+                            flush=True,
+                        )
                 
                 return self._self_play_checkpoint_policy
             except Exception:
@@ -521,9 +544,10 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 is_training_policy=False,
             )
 
-        # Check cache first
+        # Check cache first (LRU)
         if checkpoint_info.checkpoint_id in self._policy_cache:
             loaded_policy = self._policy_cache[checkpoint_info.checkpoint_id]
+            self._policy_cache.move_to_end(checkpoint_info.checkpoint_id)
             return PolicySlot(
                 policy=loaded_policy,
                 checkpoint_id=checkpoint_info.checkpoint_id,
@@ -533,8 +557,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # Load the checkpoint (already frozen by opponent_pool.load_checkpoint)
         try:
             loaded_policy = self.opponent_pool.load_checkpoint(checkpoint_info)
-            # Add to cache
-            self._policy_cache[checkpoint_info.checkpoint_id] = loaded_policy
+            # Add to cache (LRU) if enabled
+            if self.max_policy_cache_size > 0:
+                self._policy_cache[checkpoint_info.checkpoint_id] = loaded_policy
+                self._policy_cache.move_to_end(checkpoint_info.checkpoint_id)
+                while len(self._policy_cache) > self.max_policy_cache_size:
+                    self._policy_cache.popitem(last=False)
             
             return PolicySlot(
                 policy=loaded_policy,
@@ -612,13 +640,25 @@ class MultiPolicyBusEnv(gym.Wrapper):
             current_phase = self.env.unwrapped._engine.state.phase
 
             # Get action mask
-            action_mask = self.env.action_masks()
+            action_mask = None
+            try:
+                action_mask = self.env.action_masks()
+            except Exception as exc:
+                import warnings
+                warnings.warn(
+                    f"Failed to compute action mask for opponent turn "
+                    f"(error: {type(exc).__name__}: {exc}). "
+                    "Falling back to NOOP for auto-advance."
+                )
 
             # Check if we're in a state that should auto-advance
             # During RESOLVING_ACTIONS or CLEANUP, if there are no valid actions,
             # we should use NOOP to trigger auto-advance instead of asking the policy
             should_use_noop = False
-            if not np.any(action_mask):
+            if action_mask is None:
+                should_use_noop = True
+                action = self.env.unwrapped._action_config.noop_idx
+            elif not np.any(action_mask):
                 # No valid actions - check if this is expected
                 if current_phase in (Phase.RESOLVING_ACTIONS, Phase.CLEANUP):
                     # This is expected during resolution phases - some players may have
@@ -925,6 +965,37 @@ class MatchRunner:
             "avg_score_a": total_scores_a / n_games if n_games > 0 else 0,
             "avg_score_b": total_scores_b / n_games if n_games > 0 else 0,
         }
+
+    def run_multiplayer_match(
+        self,
+        policies: list["MaskablePPO"],
+        checkpoint_ids: list[str],
+        n_games: int = 1,
+    ) -> list[dict]:
+        """Play n_games of true N-player matches with per-game seat randomisation.
+
+        Unlike run_match (which expands 2 policies into N seats), this method
+        expects exactly num_players policies — one distinct policy per seat.
+        Seat assignment is shuffled independently each game to neutralise
+        first-mover bias.
+
+        Args:
+            policies: One policy per player (len must equal env num_players).
+            checkpoint_ids: Corresponding checkpoint IDs.
+            n_games: Number of games to play.
+
+        Returns:
+            List of per-game result dicts:
+                {"avg_scores": {checkpoint_id: score}, "checkpoint_ids": [...]}
+        """
+        results: list[dict] = []
+        for _ in range(n_games):
+            perm = np.random.permutation(len(policies))
+            shuffled_policies = [policies[i] for i in perm]
+            shuffled_ids = [checkpoint_ids[i] for i in perm]
+            result = self._run_single_game(shuffled_policies, shuffled_ids)
+            results.append(result)
+        return results
 
     def _run_single_game(
         self,

@@ -30,6 +30,7 @@ from .bus_env import BusEnv, make_bus_env
 from .wrappers import BusEnvSelfPlayWrapper
 from .opponent_pool import OpponentPool, CheckpointInfo, PoolConfig
 from .elo_tracker import EloTracker, MatchResult, HeadToHeadStats
+from .openskill_tracker import OpenSkillTracker
 from .multi_policy_env import MultiPolicyBusEnv, PolicySlot, MatchRunner
 from .mcts import MCTS, MCTSNode, MCTSConfig
 from .mcts_player import MCTSPlayer, PolicyPlayer, MCTSPlayerStats
@@ -74,6 +75,8 @@ __all__ = [
     "EloTracker",
     "MatchResult",
     "HeadToHeadStats",
+    # OpenSkill Rating System
+    "OpenSkillTracker",
     # MCTS
     "MCTS",
     "MCTSNode",
