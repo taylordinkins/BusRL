@@ -254,6 +254,8 @@ class BusEnv(gym.Env):
                     if next_slot is not None:
                         info["placed_marker_area"] = area_type.value
                         info["placed_marker_slot"] = next_slot.label
+                        action_info["placed_marker_area"] = area_type.value
+                        action_info["placed_marker_slot"] = next_slot.label
             step_result = self._engine.step(action_obj)
             if not step_result.success:
                 info["error"] = step_result.info.get("error", "Unknown error")

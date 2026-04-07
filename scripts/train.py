@@ -580,7 +580,7 @@ if __name__ == "__main__":
                         help="Batch size")
     parser.add_argument("--n_epochs", type=int, default=10,
                         help="Epochs per update")
-    parser.add_argument("--gamma", type=float, default=0.99,
+    parser.add_argument("--gamma", type=float, default=0.995,
                         help="Discount factor")
     parser.add_argument("--gae_lambda", type=float, default=0.98,
                         help="GAE lambda")

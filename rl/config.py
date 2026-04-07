@@ -288,6 +288,10 @@ class RewardConfig:
     time_stone_penalty: float = -0.05
     invalid_action_penalty: float = -1.0
 
+    # Marker placement shaping (early training signal)
+    marker_opportunity_bonus: float = 0.02
+    avoidable_waste_penalty: float = -0.02
+
     # Terminal rewards use point differential (no config needed)
 
     # Add a "Won Game Reward"

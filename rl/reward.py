@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
-from core.constants import Phase
+from core.constants import Phase, ActionAreaType
 from .config import RewardConfig, DEFAULT_REWARD_CONFIG, BoardConfig, DEFAULT_BOARD_CONFIG
 
 if TYPE_CHECKING:
@@ -34,6 +34,8 @@ class StepRewardInfo:
     exclusive_bonus: float = 0.0
     station_connection_reward: float = 0.0
     time_stone_penalty: float = 0.0
+    marker_opportunity_bonus: float = 0.0
+    avoidable_waste_penalty: float = 0.0
     terminal_reward: float = 0.0
 
     @property
@@ -46,6 +48,8 @@ class StepRewardInfo:
             + self.exclusive_bonus
             + self.station_connection_reward
             + self.time_stone_penalty
+            + self.marker_opportunity_bonus
+            + self.avoidable_waste_penalty
             + self.terminal_reward
         )
 
@@ -150,11 +154,82 @@ class RewardCalculator:
             state, prev_state, player_id
         )
 
+        # Dense shaping for choosing marker placements: reward actionable slots,
+        # penalize placements that are guaranteed wasted under current M#oB.
+        marker_bonus, waste_penalty = self._compute_marker_shaping(state, action_info)
+        info.marker_opportunity_bonus = marker_bonus
+        info.avoidable_waste_penalty = waste_penalty
+
         # Terminal reward
         if done:
             info.terminal_reward = self._compute_terminal_reward(state, player_id)
 
         return info
+
+    def _compute_marker_shaping(
+        self,
+        state: "GameState",
+        action_info: Optional[dict],
+    ) -> tuple[float, float]:
+        """Compute shaping on marker placement quality.
+
+        Applies only to M#oB-scaled resolution areas where late slots can become
+        guaranteed waste: Line Expansion, Passengers, Buildings.
+        """
+        if not action_info:
+            return 0.0, 0.0
+        if action_info.get("action_type") != "CHOOSING_ACTIONS":
+            return 0.0, 0.0
+
+        area = action_info.get("placed_marker_area")
+        slot_label = action_info.get("placed_marker_slot")
+        if area is None or slot_label is None:
+            return 0.0, 0.0
+
+        if area not in {"line_expansion", "passengers", "buildings"}:
+            return 0.0, 0.0
+
+        slot_to_index = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
+        slot_index = slot_to_index.get(str(slot_label).upper())
+        if slot_index is None:
+            return 0.0, 0.0
+
+        projected_max_buses = self._projected_max_buses_for_area(state, area)
+        actionable = (projected_max_buses - slot_index) > 0
+        if actionable:
+            return float(self.config.marker_opportunity_bonus), 0.0
+        return 0.0, float(self.config.avoidable_waste_penalty)
+
+    def _projected_max_buses_for_area(self, state: "GameState", area: str) -> int:
+        """Compute M#oB used for marker-shaping estimates.
+
+        For downstream areas (Passengers/Buildings), include the pending Buses
+        marker effect if a bus can be gained. Line Expansion explicitly excludes
+        this because it resolves before Buses.
+        """
+        current_max = max(p.buses for p in state.players)
+
+        # Explicitly exclude line expansion from projected bus increases.
+        if area == ActionAreaType.LINE_EXPANSION.value:
+            return current_max
+
+        # Only downstream M#oB-scaled areas use projected bus count.
+        if area not in {
+            ActionAreaType.PASSENGERS.value,
+            ActionAreaType.BUILDINGS.value,
+        }:
+            return current_max
+
+        buses_markers = state.action_board.get_markers_to_resolve(ActionAreaType.BUSES)
+        if not buses_markers:
+            return current_max
+
+        bus_slot = buses_markers[0]
+        player = state.get_player(bus_slot.player_id)
+        if not player.can_gain_bus():
+            return current_max
+
+        return max(current_max, player.buses + 1)
 
     def _compute_delivery_reward(
         self,
