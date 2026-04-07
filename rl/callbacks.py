@@ -940,7 +940,11 @@ class EvalStatsCallback(BaseCallback):
         total_steps = 0
 
         for _ in range(self.n_eval_episodes):
-            obs, _ = self.eval_env.reset()
+            reset_out = self.eval_env.reset()
+            if isinstance(reset_out, tuple) and len(reset_out) == 2:
+                obs, _ = reset_out
+            else:
+                obs = reset_out
             terminated = False
             truncated = False
 
@@ -949,11 +953,16 @@ class EvalStatsCallback(BaseCallback):
                 action, _ = self.model.predict(
                     obs, action_masks=masks, deterministic=self.deterministic
                 )
-                obs, rewards, dones, truncs, infos = self.eval_env.step(action)
-                terminated = bool(dones[0])
-                truncated = bool(truncs[0])
+                step_out = self.eval_env.step(action)
+                if len(step_out) == 4:
+                    obs, rewards, dones, infos = step_out
+                    truncs = [False for _ in np.atleast_1d(dones)]
+                else:
+                    obs, rewards, dones, truncs, infos = step_out
+                terminated = bool(np.atleast_1d(dones)[0])
+                truncated = bool(np.atleast_1d(truncs)[0])
 
-                info = infos[0]
+                info = infos[0] if isinstance(infos, (list, tuple)) else infos
                 head_id = info.get("head_id")
                 if head_id is not None:
                     if isinstance(head_id, str):
@@ -971,7 +980,7 @@ class EvalStatsCallback(BaseCallback):
                 total_steps += 1
 
             # End of episode: compute score diff using score - time_stones
-            final_info = infos[0]
+            final_info = infos[0] if isinstance(infos, (list, tuple)) else infos
             scores = final_info.get("scores", {})
             time_stones = final_info.get("time_stones", {})
             if scores:
