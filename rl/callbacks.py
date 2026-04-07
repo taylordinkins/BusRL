@@ -21,6 +21,7 @@ except ImportError:
 
 from stable_baselines3.common.callbacks import BaseCallback
 from sb3_contrib.common.maskable.utils import get_action_masks
+from collections import defaultdict
 
 if TYPE_CHECKING:
     from .opponent_pool import OpponentPool
@@ -857,6 +858,11 @@ class HeadUsageCallback(BaseCallback):
             HeadId.RESOLVE_VRROOMM_PASSENGER: "vr_pax",
             HeadId.RESOLVE_VRROOMM_DEST: "vr_dst",
         }
+        self._marker_area_counts: dict[str, int] = {}
+        self._waste_area_counts: dict[str, int] = {}
+        self._waste_total: int = 0
+        self._seen_waste_rounds: set[tuple[int, int, int, str]] = set()
+        self._episode_counters = defaultdict(int)
 
     def _on_training_start(self) -> None:
         labels = ", ".join(
@@ -867,9 +873,11 @@ class HeadUsageCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos")
+        dones = self.locals.get("dones")
         if infos:
-            for info in infos:
-                head_id = info.get("head_id")
+            for env_idx, info in enumerate(infos):
+                episode_id = int(self._episode_counters[env_idx])
+                head_id = info.get("action_head_id", info.get("head_id"))
                 if head_id is None:
                     continue
                 if isinstance(head_id, str):
@@ -884,6 +892,30 @@ class HeadUsageCallback(BaseCallback):
                         continue
                 if isinstance(head_id, HeadId):
                     self._counts[head_id] += 1
+                placed_area = info.get("placed_marker_area")
+                if placed_area:
+                    self._marker_area_counts[placed_area] = (
+                        self._marker_area_counts.get(placed_area, 0) + 1
+                    )
+
+                waste_by_area = info.get("resolution_waste_by_area")
+                round_num = info.get("round")
+                if waste_by_area and round_num is not None:
+                    for area_key, stats in waste_by_area.items():
+                        token = (env_idx, episode_id, int(round_num), area_key)
+                        if token in self._seen_waste_rounds:
+                            continue
+                        self._seen_waste_rounds.add(token)
+                        wasted = int(stats.get("wasted", 0))
+                        self._waste_area_counts[area_key] = (
+                            self._waste_area_counts.get(area_key, 0) + wasted
+                        )
+                        self._waste_total += wasted
+        if dones is not None:
+            done_arr = np.atleast_1d(dones)
+            for env_idx, done in enumerate(done_arr):
+                if done:
+                    self._episode_counters[env_idx] += 1
         return True
 
     def _on_rollout_end(self) -> None:
@@ -902,7 +934,17 @@ class HeadUsageCallback(BaseCallback):
             if total > 0:
                 self.logger.record(f"rollout/head_usage_pct/{key}", count / total)
 
+        for area_key, count in self._marker_area_counts.items():
+            self.logger.record(f"rollout/marker_placed/{area_key}", count)
+        for area_key, count in self._waste_area_counts.items():
+            self.logger.record(f"rollout/wasted_markers/{area_key}", count)
+        self.logger.record("rollout/wasted_markers_total", self._waste_total)
+
         self._counts = {head: 0 for head in HeadId}
+        self._marker_area_counts = {}
+        self._waste_area_counts = {}
+        self._waste_total = 0
+        self._seen_waste_rounds = set()
 
 
 class EvalStatsCallback(BaseCallback):
@@ -938,8 +980,12 @@ class EvalStatsCallback(BaseCallback):
         score_diffs: list[float] = []
         head_counts = {head: 0 for head in HeadId}
         total_steps = 0
+        marker_area_counts: dict[str, int] = {}
+        waste_area_counts: dict[str, int] = {}
+        waste_total = 0
+        seen_waste_rounds: set[tuple[int, str]] = set()
 
-        for _ in range(self.n_eval_episodes):
+        for episode_idx in range(self.n_eval_episodes):
             reset_out = self.eval_env.reset()
             if isinstance(reset_out, tuple) and len(reset_out) == 2:
                 obs, _ = reset_out
@@ -963,7 +1009,7 @@ class EvalStatsCallback(BaseCallback):
                 truncated = bool(np.atleast_1d(truncs)[0])
 
                 info = infos[0] if isinstance(infos, (list, tuple)) else infos
-                head_id = info.get("head_id")
+                head_id = info.get("action_head_id", info.get("head_id"))
                 if head_id is not None:
                     if isinstance(head_id, str):
                         try:
@@ -977,6 +1023,24 @@ class EvalStatsCallback(BaseCallback):
                             head_id = None
                 if isinstance(head_id, HeadId):
                     head_counts[head_id] += 1
+                placed_area = info.get("placed_marker_area")
+                if placed_area:
+                    marker_area_counts[placed_area] = (
+                        marker_area_counts.get(placed_area, 0) + 1
+                    )
+                waste_by_area = info.get("resolution_waste_by_area")
+                round_num = info.get("round")
+                if waste_by_area and round_num is not None:
+                    for area_key, stats in waste_by_area.items():
+                        token = (int(episode_idx), int(round_num), area_key)
+                        if token in seen_waste_rounds:
+                            continue
+                        seen_waste_rounds.add(token)
+                        wasted = int(stats.get("wasted", 0))
+                        waste_area_counts[area_key] = (
+                            waste_area_counts.get(area_key, 0) + wasted
+                        )
+                        waste_total += wasted
                 total_steps += 1
 
             # End of episode: compute score diff using score - time_stones
@@ -1006,6 +1070,12 @@ class EvalStatsCallback(BaseCallback):
             self.logger.record(f"eval/head_usage/{key}", count)
             if total_steps > 0:
                 self.logger.record(f"eval/head_usage_pct/{key}", count / total_steps)
+
+        for area_key, count in marker_area_counts.items():
+            self.logger.record(f"eval/marker_placed/{area_key}", count)
+        for area_key, count in waste_area_counts.items():
+            self.logger.record(f"eval/wasted_markers/{area_key}", count)
+        self.logger.record("eval/wasted_markers_total", waste_total)
 
     def _on_step(self) -> bool:
         if self.eval_freq <= 0:

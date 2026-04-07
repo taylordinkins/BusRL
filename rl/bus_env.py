@@ -22,7 +22,12 @@ except ImportError:
 
 from core.game_state import GameState
 from core.board import BoardGraph
-from core.constants import Phase, ActionAreaType, ACTION_RESOLUTION_ORDER
+from core.constants import (
+    Phase,
+    ActionAreaType,
+    ACTION_RESOLUTION_ORDER,
+    MIN_MARKERS_PER_ROUND,
+)
 from engine.game_engine import GameEngine, Action, ActionType
 from engine.action_resolver import ActionResolver, ResolutionStatus
 from data.loader import load_default_board
@@ -117,6 +122,10 @@ class BusEnv(gym.Env):
         self._last_state_hash: str = ""
         # For logging true episode lengths
         self._episode_lengths: list[int] = []
+        # Resolution waste tracking (per round)
+        self._resolution_waste_round: Optional[int] = None
+        self._resolution_waste_by_area: dict[str, dict[str, int]] = {}
+        self._resolution_waste_total: int = 0
 
         # Define spaces
         self.observation_space = spaces.Box(
@@ -153,6 +162,9 @@ class BusEnv(gym.Env):
         self._resolver = None
         self._decision_cache = None
         self._vrroomm_stage_state.complete()
+        self._resolution_waste_round = None
+        self._resolution_waste_by_area = {}
+        self._resolution_waste_total = 0
 
         # Episode bookkeeping
         self._step_count = 0
@@ -186,6 +198,13 @@ class BusEnv(gym.Env):
         decision = self._get_decision_context()
         head_id = decision.get("head_id") if decision else None
         mask = decision.get("mask") if decision else None
+
+        if isinstance(head_id, HeadId):
+            info["action_head_id"] = head_id.value
+            info["action_head_name"] = head_id.name
+        else:
+            info["action_head_id"] = None
+            info["action_head_name"] = None
 
         if head_id is None or mask is None:
             # No decision required; auto-advance and return
@@ -221,6 +240,20 @@ class BusEnv(gym.Env):
             if action not in decision["valid_index_to_action"]:
                 raise RuntimeError("Chosen action not in valid action mapping")
             action_obj = decision["valid_index_to_action"][action]
+            if head_id == HeadId.CHOOSING_ACTIONS and action_obj.action_type == ActionType.PASS:
+                current_player = self._engine.state.get_current_player()
+                if not (
+                    current_player.markers_placed_this_round >= MIN_MARKERS_PER_ROUND
+                    or current_player.action_markers_remaining == 0
+                ):
+                    raise RuntimeError("PASS chosen before minimum marker placement")
+            if head_id == HeadId.CHOOSING_ACTIONS and action_obj.action_type == ActionType.PLACE_MARKER:
+                area_type = ActionAreaType(action_obj.params["area_type"])
+                if self._engine is not None:
+                    next_slot = self._engine.state.action_board.get_area(area_type).get_next_available_slot()
+                    if next_slot is not None:
+                        info["placed_marker_area"] = area_type.value
+                        info["placed_marker_slot"] = next_slot.label
             step_result = self._engine.step(action_obj)
             if not step_result.success:
                 info["error"] = step_result.info.get("error", "Unknown error")
@@ -308,6 +341,10 @@ class BusEnv(gym.Env):
         # Merge info
         new_info = self._get_info()
         info.update(new_info)
+        info["next_head_id"] = new_info.get("head_id")
+        info["next_head_name"] = new_info.get("head_name")
+        info["head_id"] = info.get("action_head_id")
+        info["head_name"] = info.get("action_head_name")
         info["acting_player"] = acting_player
         info["reward_breakdown"] = self._reward_calculator.compute_reward_detailed(
             self._engine.state, prev_state, acting_player, terminated, action_info
@@ -393,6 +430,7 @@ class BusEnv(gym.Env):
         while True:
             ctx = resolver.get_context()
             self._sync_resolution_state()
+            self._maybe_record_resolution_waste(ctx)
 
             if ctx.status == ResolutionStatus.AWAITING_INPUT:
                 if ctx.current_area == ActionAreaType.VRROOMM:
@@ -409,6 +447,50 @@ class BusEnv(gym.Env):
                 return ctx
 
             resolver.advance()
+
+    def _maybe_record_resolution_waste(self, ctx: "ResolutionContext") -> None:
+        if self._engine is None or ctx.current_area is None:
+            return
+        if self._resolution_waste_round != self._engine.state.global_state.round_number:
+            self._resolution_waste_round = self._engine.state.global_state.round_number
+            self._resolution_waste_by_area = {}
+            self._resolution_waste_total = 0
+
+        area = ctx.current_area
+        if area not in (
+            ActionAreaType.LINE_EXPANSION,
+            ActionAreaType.PASSENGERS,
+            ActionAreaType.BUILDINGS,
+        ):
+            return
+
+        area_key = area.value
+        if area_key in self._resolution_waste_by_area:
+            return
+
+        max_buses = max(p.buses for p in self._engine.state.players)
+        area_obj = self._engine.state.action_board.get_area(area)
+
+        slot_index_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
+        total_markers = 0
+        wasted_markers = 0
+
+        for slot in area_obj.slots.values():
+            if slot.player_id is None:
+                continue
+            total_markers += 1
+            slot_index = slot_index_map.get(slot.label, 0)
+            if (max_buses - slot_index) <= 0:
+                wasted_markers += 1
+
+        self._resolution_waste_by_area[area_key] = {
+            "total": total_markers,
+            "wasted": wasted_markers,
+            "max_buses": max_buses,
+        }
+        self._resolution_waste_total = sum(
+            item["wasted"] for item in self._resolution_waste_by_area.values()
+        )
 
     def _advance_after_action(self) -> None:
         if self._engine is None:
@@ -577,6 +659,8 @@ class BusEnv(gym.Env):
             "head_id": head_id.value if isinstance(head_id, HeadId) else None,
             "head_name": head_id.name if isinstance(head_id, HeadId) else None,
             "vrroomm_stage": self._vrroomm_stage_state.stage,
+            "resolution_waste_by_area": self._resolution_waste_by_area or None,
+            "resolution_waste_total": self._resolution_waste_total,
             "scores": {p.player_id: p.score for p in state.players},
             "time_stones": {p.player_id: p.time_stones for p in state.players},
             "buses": {p.player_id: p.buses for p in state.players},
