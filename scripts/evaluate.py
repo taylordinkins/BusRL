@@ -89,7 +89,8 @@ def evaluate(args):
         terminated = False
         steps = 0
 
-        while not terminated and steps < 5000:
+        truncated = False
+        while not terminated and not truncated and steps < 5000:
             if args.use_mcts:
                 # Get underlying BusEnv for MCTS
                 base_env = env.env  # Unwrap BusEnvSelfPlayWrapper
@@ -109,10 +110,15 @@ def evaluate(args):
 
         # Record stats
         scores = info.get("scores", {})
+        time_stones = info.get("time_stones", {})
         if scores:
-            winner = max(scores, key=scores.get)
+            adjusted_scores = {
+                p_id: score - time_stones.get(p_id, 0)
+                for p_id, score in scores.items()
+            }
+            winner = max(adjusted_scores, key=adjusted_scores.get)
             win_counts[winner] += 1
-            for p_id, score in scores.items():
+            for p_id, score in adjusted_scores.items():
                 total_scores[p_id] += score
 
         p_rewards_game = info.get("episode_player_rewards", {})

@@ -273,6 +273,10 @@ class BusEnv(gym.Env):
                 HeadId.RESOLVE_VRROOMM_PASSENGER, VRROOMM_SKIP
             )
             if action == skip_idx:
+                if decision.get("valid_passenger_ids"):
+                    raise RuntimeError(
+                        "VRROOMM skip is not allowed while legal deliveries exist"
+                    )
                 if self._resolver is not None:
                     self._resolver.skip_vrroomm_deliveries()
                 self._skip_vrroomm()
@@ -558,10 +562,6 @@ class BusEnv(gym.Env):
                     HeadId.RESOLVE_VRROOMM_PASSENGER, passenger_id
                 )
                 mask[idx] = True
-            skip_idx = self._hier_action_mapping.action_to_index(
-                HeadId.RESOLVE_VRROOMM_PASSENGER, VRROOMM_SKIP
-            )
-            mask[skip_idx] = True
 
         elif head_id == HeadId.RESOLVE_VRROOMM_DEST:
             selected_id = self._vrroomm_stage_state.selected_passenger_id
@@ -596,6 +596,21 @@ class BusEnv(gym.Env):
             "valid_index_to_action": valid_index_to_action,
             "valid_passenger_ids": valid_passenger_ids,
             "valid_destinations": valid_destinations,
+            "resolution_area": (
+                resolver_ctx.current_area.value
+                if resolver_ctx is not None and resolver_ctx.current_area is not None
+                else None
+            ),
+            "resolution_slot_label": (
+                resolver_ctx.current_slot.label
+                if resolver_ctx is not None and resolver_ctx.current_slot is not None
+                else None
+            ),
+            "resolution_slot_player": (
+                resolver_ctx.current_slot.player_id
+                if resolver_ctx is not None and resolver_ctx.current_slot is not None
+                else None
+            ),
         }
         return self._decision_cache
 
@@ -658,6 +673,15 @@ class BusEnv(gym.Env):
             "valid_action_count": valid_action_count,
             "head_id": head_id.value if isinstance(head_id, HeadId) else None,
             "head_name": head_id.name if isinstance(head_id, HeadId) else None,
+            "resolution_area": (
+                decision.get("resolution_area") if decision is not None else None
+            ),
+            "resolution_slot_label": (
+                decision.get("resolution_slot_label") if decision is not None else None
+            ),
+            "resolution_slot_player": (
+                decision.get("resolution_slot_player") if decision is not None else None
+            ),
             "vrroomm_stage": self._vrroomm_stage_state.stage,
             "resolution_waste_by_area": self._resolution_waste_by_area or None,
             "resolution_waste_total": self._resolution_waste_total,

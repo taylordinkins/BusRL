@@ -257,6 +257,7 @@ def train(args):
                         self_play_checkpoint_path=self_play_checkpoint,
                         refresh_every_n_episodes=5,
                         log_self_play_checkpoint=_log_self_play_checkpoint,
+                        update_win_rate_stats=(_skill_tracking != "openskill"),
                     )
                 else:
                     # For DummyVecEnv: use the main process's OpponentPool
@@ -270,6 +271,7 @@ def train(args):
                         randomize_training_slot=_randomize_training_slot,
                         self_play_checkpoint_path=self_play_checkpoint,
                         log_self_play_checkpoint=_log_self_play_checkpoint,
+                        update_win_rate_stats=(_skill_tracking != "openskill"),
                     )
             else:
                 env = BusEnvSelfPlayWrapper(env)
@@ -337,7 +339,7 @@ def train(args):
 
     # Standard checkpoint callback
     checkpoint_callback = CheckpointCallback(
-        save_freq=args.save_freq // args.n_envs,
+        save_freq=max(1, args.save_freq // args.n_envs),
         save_path=os.path.join(log_dir, "checkpoints"),
         name_prefix="bus_model",
     )
@@ -348,7 +350,7 @@ def train(args):
         eval_env,
         best_model_save_path=os.path.join(log_dir, "best_model"),
         log_path=log_dir,
-        eval_freq=args.eval_freq // args.n_envs,
+        eval_freq=max(1, args.eval_freq // args.n_envs),
         n_eval_episodes=args.n_eval_episodes,
         deterministic=True,
         render=False,
@@ -356,7 +358,7 @@ def train(args):
     callbacks.append(eval_callback)
     eval_stats_callback = EvalStatsCallback(
         eval_env=eval_env,
-        eval_freq=args.eval_freq // args.n_envs,
+        eval_freq=max(1, args.eval_freq),
         n_eval_episodes=args.n_eval_episodes,
         deterministic=True,
         verbose=0,

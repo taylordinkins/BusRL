@@ -469,7 +469,7 @@ class OpponentPoolEvalCallback(BaseCallback):
             allow_duplicates=False,
         )
 
-        total_wins = 0
+        total_points = 0.0
         total_games = 0
         results_by_opponent = {}
 
@@ -486,7 +486,10 @@ class OpponentPoolEvalCallback(BaseCallback):
                     randomize_seats=True,
                 )
 
-                total_wins += match_result["wins_a"]
+                total_points += match_result.get(
+                    "points_a",
+                    match_result["wins_a"] + 0.5 * match_result.get("draws", 0),
+                )
                 total_games += match_result["total_games"]
 
                 # Store result
@@ -514,10 +517,10 @@ class OpponentPoolEvalCallback(BaseCallback):
         # Sync Elo from tracker to pool
         self.opponent_pool.sync_elo_from_tracker()
 
-        overall_win_rate = total_wins / total_games if total_games > 0 else 0.5
+        overall_win_rate = total_points / total_games if total_games > 0 else 0.5
 
         results = {
-            "total_wins": total_wins,
+            "total_wins": total_points,
             "total_games": total_games,
             "overall_win_rate": overall_win_rate,
             "opponents_evaluated": len(results_by_opponent),
@@ -545,7 +548,7 @@ class OpponentPoolEvalCallback(BaseCallback):
         )
 
         total_games_budget = self.max_opponents * self.n_eval_games
-        total_wins = 0
+        total_points = 0.0
         total_games = 0
         results_by_opponent: dict[str, dict] = {}
 
@@ -615,11 +618,14 @@ class OpponentPoolEvalCallback(BaseCallback):
             game_scores = [avg_scores[pid] for pid in game_ids]
             self.elo_tracker.update_ratings_multiplayer(game_ids, game_scores)
 
-            # Win = current achieved the highest score (ties count as win)
+            # Draw-aware points: win=1.0, draw for top=0.5, loss=0.0
             current_score = avg_scores.get("__current__", 0)
             max_score = max(avg_scores.values())
-            if current_score >= max_score:
-                total_wins += 1
+            top_count = sum(1 for s in avg_scores.values() if s == max_score)
+            if current_score == max_score and top_count == 1:
+                total_points += 1.0
+            elif current_score == max_score and top_count > 1:
+                total_points += 0.5
             total_games += 1
 
             # Track per-opponent stats
@@ -634,7 +640,7 @@ class OpponentPoolEvalCallback(BaseCallback):
         # Sync mu values from tracker to pool checkpoints
         self.opponent_pool.sync_elo_from_tracker()
 
-        overall_win_rate = total_wins / total_games if total_games > 0 else 0.5
+        overall_win_rate = total_points / total_games if total_games > 0 else 0.5
 
         if self.verbose > 0:
             for opp_id, info in sorted(
@@ -644,7 +650,7 @@ class OpponentPoolEvalCallback(BaseCallback):
                 print(f"  vs {opp_id}: {info['games']} games, mu={self.elo_tracker.get_rating(opp_id):.1f}")
 
         return {
-            "total_wins": total_wins,
+            "total_wins": total_points,
             "total_games": total_games,
             "overall_win_rate": overall_win_rate,
             "opponents_evaluated": len(results_by_opponent),
@@ -859,10 +865,15 @@ class HeadUsageCallback(BaseCallback):
             HeadId.RESOLVE_VRROOMM_DEST: "vr_dst",
         }
         self._marker_area_counts: dict[str, int] = {}
+        self._opportunity_area_counts: dict[str, int] = {}
+        self._reward_by_area: dict[str, float] = {}
         self._waste_area_counts: dict[str, int] = {}
+        self._resolution_total_counts: dict[str, int] = {}
         self._waste_total: int = 0
         self._seen_waste_rounds: set[tuple[int, int, int, str]] = set()
+        self._seen_opportunity_slots: set[tuple[int, int, int, str, str, int]] = set()
         self._episode_counters = defaultdict(int)
+        self._internal_steps_total: int = 0
 
     def _on_training_start(self) -> None:
         labels = ", ".join(
@@ -877,40 +888,141 @@ class HeadUsageCallback(BaseCallback):
         if infos:
             for env_idx, info in enumerate(infos):
                 episode_id = int(self._episode_counters[env_idx])
-                head_id = info.get("action_head_id", info.get("head_id"))
-                if head_id is None:
-                    continue
-                if isinstance(head_id, str):
-                    try:
-                        head_id = HeadId[head_id]
-                    except KeyError:
-                        continue
-                elif isinstance(head_id, int):
-                    try:
-                        head_id = HeadId(head_id)
-                    except ValueError:
-                        continue
-                if isinstance(head_id, HeadId):
-                    self._counts[head_id] += 1
-                placed_area = info.get("placed_marker_area")
-                if placed_area:
-                    self._marker_area_counts[placed_area] = (
-                        self._marker_area_counts.get(placed_area, 0) + 1
-                    )
+                self._internal_steps_total += int(info.get("telemetry_internal_steps", 1))
 
-                waste_by_area = info.get("resolution_waste_by_area")
-                round_num = info.get("round")
-                if waste_by_area and round_num is not None:
-                    for area_key, stats in waste_by_area.items():
-                        token = (env_idx, episode_id, int(round_num), area_key)
-                        if token in self._seen_waste_rounds:
+                telemetry_head_counts = info.get("telemetry_head_counts")
+                if telemetry_head_counts:
+                    for head_key, count in telemetry_head_counts.items():
+                        try:
+                            head_id = HeadId(int(head_key))
+                        except (TypeError, ValueError):
                             continue
-                        self._seen_waste_rounds.add(token)
-                        wasted = int(stats.get("wasted", 0))
-                        self._waste_area_counts[area_key] = (
-                            self._waste_area_counts.get(area_key, 0) + wasted
+                        self._counts[head_id] += int(count)
+                else:
+                    head_id = info.get("action_head_id", info.get("head_id"))
+                    if head_id is not None:
+                        if isinstance(head_id, str):
+                            try:
+                                head_id = HeadId[head_id]
+                            except KeyError:
+                                head_id = None
+                        elif isinstance(head_id, int):
+                            try:
+                                head_id = HeadId(head_id)
+                            except ValueError:
+                                head_id = None
+                    if isinstance(head_id, HeadId):
+                        self._counts[head_id] += 1
+
+                telemetry_marker_counts = info.get("telemetry_marker_counts")
+                if telemetry_marker_counts:
+                    for area_key, count in telemetry_marker_counts.items():
+                        self._marker_area_counts[area_key] = (
+                            self._marker_area_counts.get(area_key, 0) + int(count)
                         )
-                        self._waste_total += wasted
+                else:
+                    placed_area = info.get("placed_marker_area")
+                    if placed_area:
+                        self._marker_area_counts[placed_area] = (
+                            self._marker_area_counts.get(placed_area, 0) + 1
+                        )
+
+                telemetry_opportunity_counts = info.get("telemetry_opportunity_counts")
+                if telemetry_opportunity_counts:
+                    for area_key, count in telemetry_opportunity_counts.items():
+                        self._opportunity_area_counts[area_key] = (
+                            self._opportunity_area_counts.get(area_key, 0) + int(count)
+                        )
+                else:
+                    resolution_area = info.get("resolution_area")
+                    resolution_slot_label = info.get("resolution_slot_label")
+                    resolution_slot_player = info.get("resolution_slot_player")
+                    round_num = info.get("round")
+                    valid_action_count = int(info.get("valid_action_count", 0) or 0)
+                    if (
+                        resolution_area
+                        and resolution_slot_label is not None
+                        and resolution_slot_player is not None
+                        and round_num is not None
+                        and valid_action_count > 0
+                    ):
+                        token = (
+                            env_idx,
+                            episode_id,
+                            int(round_num),
+                            str(resolution_area),
+                            str(resolution_slot_label),
+                            int(resolution_slot_player),
+                        )
+                        if token not in self._seen_opportunity_slots:
+                            self._seen_opportunity_slots.add(token)
+                            self._opportunity_area_counts[str(resolution_area)] = (
+                                self._opportunity_area_counts.get(str(resolution_area), 0)
+                                + 1
+                            )
+
+                telemetry_reward_by_area = info.get("telemetry_reward_by_area")
+                if telemetry_reward_by_area:
+                    for area_key, reward_sum in telemetry_reward_by_area.items():
+                        self._reward_by_area[area_key] = float(
+                            self._reward_by_area.get(area_key, 0.0)
+                        ) + float(reward_sum)
+                else:
+                    head_id = info.get("action_head_id", info.get("head_id"))
+                    reward_area = None
+                    try:
+                        head_int = int(head_id) if head_id is not None else None
+                    except (TypeError, ValueError):
+                        head_int = None
+                    if head_int == 4:
+                        reward_area = "line_expansion"
+                    elif head_int == 5:
+                        reward_area = "passengers"
+                    elif head_int == 6:
+                        reward_area = "buildings"
+                    elif head_int == 7:
+                        reward_area = "time_clock"
+                    elif head_int in (8, 9):
+                        reward_area = "vrroomm"
+                    rewards = self.locals.get("rewards")
+                    if reward_area is not None and rewards is not None and env_idx < len(np.atleast_1d(rewards)):
+                        reward_value = float(np.atleast_1d(rewards)[env_idx])
+                        self._reward_by_area[reward_area] = float(
+                            self._reward_by_area.get(reward_area, 0.0)
+                        ) + reward_value
+
+                telemetry_wasted_counts = info.get("telemetry_wasted_counts")
+                telemetry_resolution_totals = info.get("telemetry_resolution_totals")
+                if telemetry_wasted_counts:
+                    for area_key, count in telemetry_wasted_counts.items():
+                        c = int(count)
+                        self._waste_area_counts[area_key] = (
+                            self._waste_area_counts.get(area_key, 0) + c
+                        )
+                        self._waste_total += c
+                    if telemetry_resolution_totals:
+                        for area_key, total in telemetry_resolution_totals.items():
+                            self._resolution_total_counts[area_key] = (
+                                self._resolution_total_counts.get(area_key, 0) + int(total)
+                            )
+                else:
+                    waste_by_area = info.get("resolution_waste_by_area")
+                    round_num = info.get("round")
+                    if waste_by_area and round_num is not None:
+                        for area_key, stats in waste_by_area.items():
+                            token = (env_idx, episode_id, int(round_num), area_key)
+                            if token in self._seen_waste_rounds:
+                                continue
+                            self._seen_waste_rounds.add(token)
+                            wasted = int(stats.get("wasted", 0))
+                            self._waste_area_counts[area_key] = (
+                                self._waste_area_counts.get(area_key, 0) + wasted
+                            )
+                            self._resolution_total_counts[area_key] = (
+                                self._resolution_total_counts.get(area_key, 0)
+                                + int(stats.get("total", 0))
+                            )
+                            self._waste_total += wasted
         if dones is not None:
             done_arr = np.atleast_1d(dones)
             for env_idx, done in enumerate(done_arr):
@@ -936,15 +1048,71 @@ class HeadUsageCallback(BaseCallback):
 
         for area_key, count in self._marker_area_counts.items():
             self.logger.record(f"rollout/marker_placed/{area_key}", count)
+
+        tracked_areas = set(self._marker_area_counts.keys()) | set(self._opportunity_area_counts.keys())
+        for area_key in sorted(tracked_areas):
+            markers = int(self._marker_area_counts.get(area_key, 0))
+            opportunities = int(self._opportunity_area_counts.get(area_key, 0))
+            self.logger.record(f"rollout/marker_opportunities/{area_key}", opportunities)
+            if markers > 0:
+                self.logger.record(
+                    f"rollout/marker_to_opportunity_ratio/{area_key}",
+                    opportunities / markers,
+                )
+
+        reward_areas = set(self._reward_by_area.keys()) | set(self._marker_area_counts.keys())
+        for area_key in sorted(reward_areas):
+            markers = int(self._marker_area_counts.get(area_key, 0))
+            reward_sum = float(self._reward_by_area.get(area_key, 0.0))
+            self.logger.record(f"rollout/reward_by_marker_area/{area_key}", reward_sum)
+            if markers > 0:
+                self.logger.record(
+                    f"rollout/reward_yield_per_marker/{area_key}",
+                    reward_sum / markers,
+                )
+
         for area_key, count in self._waste_area_counts.items():
             self.logger.record(f"rollout/wasted_markers/{area_key}", count)
+            total_markers = self._resolution_total_counts.get(area_key, 0)
+            self.logger.record(f"rollout/resolution_markers_total/{area_key}", total_markers)
+            if total_markers > 0:
+                self.logger.record(
+                    f"rollout/wasted_marker_rate/{area_key}",
+                    count / total_markers,
+                )
+            actionable = max(0, int(total_markers) - int(count))
+            opportunities = int(self._opportunity_area_counts.get(area_key, 0))
+            avoidable_est = max(0, actionable - opportunities)
+            self.logger.record(
+                f"rollout/waste_unavoidable/{area_key}",
+                int(count),
+            )
+            self.logger.record(
+                f"rollout/waste_actionable_marker_pool/{area_key}",
+                actionable,
+            )
+            self.logger.record(
+                f"rollout/waste_avoidable_est/{area_key}",
+                avoidable_est,
+            )
+            if actionable > 0:
+                self.logger.record(
+                    f"rollout/waste_avoidable_rate_est/{area_key}",
+                    avoidable_est / actionable,
+                )
         self.logger.record("rollout/wasted_markers_total", self._waste_total)
+        self.logger.record("rollout/internal_steps_total", self._internal_steps_total)
 
         self._counts = {head: 0 for head in HeadId}
         self._marker_area_counts = {}
+        self._opportunity_area_counts = {}
+        self._reward_by_area = {}
         self._waste_area_counts = {}
+        self._resolution_total_counts = {}
         self._waste_total = 0
         self._seen_waste_rounds = set()
+        self._seen_opportunity_slots = set()
+        self._internal_steps_total = 0
 
 
 class EvalStatsCallback(BaseCallback):
@@ -981,9 +1149,13 @@ class EvalStatsCallback(BaseCallback):
         head_counts = {head: 0 for head in HeadId}
         total_steps = 0
         marker_area_counts: dict[str, int] = {}
+        opportunity_area_counts: dict[str, int] = {}
+        reward_by_area: dict[str, float] = {}
         waste_area_counts: dict[str, int] = {}
+        resolution_total_counts: dict[str, int] = {}
         waste_total = 0
         seen_waste_rounds: set[tuple[int, str]] = set()
+        seen_opportunity_slots: set[tuple[int, int, str, str, int]] = set()
 
         for episode_idx in range(self.n_eval_episodes):
             reset_out = self.eval_env.reset()
@@ -1010,6 +1182,12 @@ class EvalStatsCallback(BaseCallback):
 
                 info = infos[0] if isinstance(infos, (list, tuple)) else infos
                 head_id = info.get("action_head_id", info.get("head_id"))
+                head_int = None
+                try:
+                    if head_id is not None:
+                        head_int = int(head_id)
+                except (TypeError, ValueError):
+                    head_int = None
                 if head_id is not None:
                     if isinstance(head_id, str):
                         try:
@@ -1028,8 +1206,50 @@ class EvalStatsCallback(BaseCallback):
                     marker_area_counts[placed_area] = (
                         marker_area_counts.get(placed_area, 0) + 1
                     )
-                waste_by_area = info.get("resolution_waste_by_area")
+
+                resolution_area = info.get("resolution_area")
+                resolution_slot_label = info.get("resolution_slot_label")
+                resolution_slot_player = info.get("resolution_slot_player")
                 round_num = info.get("round")
+                valid_action_count = int(info.get("valid_action_count", 0) or 0)
+                if (
+                    resolution_area
+                    and resolution_slot_label is not None
+                    and resolution_slot_player is not None
+                    and round_num is not None
+                    and valid_action_count > 0
+                ):
+                    token = (
+                        int(episode_idx),
+                        int(round_num),
+                        str(resolution_area),
+                        str(resolution_slot_label),
+                        int(resolution_slot_player),
+                    )
+                    if token not in seen_opportunity_slots:
+                        seen_opportunity_slots.add(token)
+                        opportunity_area_counts[str(resolution_area)] = (
+                            opportunity_area_counts.get(str(resolution_area), 0) + 1
+                        )
+
+                reward_area = None
+                if head_int == 4:
+                    reward_area = "line_expansion"
+                elif head_int == 5:
+                    reward_area = "passengers"
+                elif head_int == 6:
+                    reward_area = "buildings"
+                elif head_int == 7:
+                    reward_area = "time_clock"
+                elif head_int in (8, 9):
+                    reward_area = "vrroomm"
+                if reward_area is not None:
+                    reward_value = float(np.atleast_1d(rewards)[0])
+                    reward_by_area[reward_area] = float(
+                        reward_by_area.get(reward_area, 0.0)
+                    ) + reward_value
+
+                waste_by_area = info.get("resolution_waste_by_area")
                 if waste_by_area and round_num is not None:
                     for area_key, stats in waste_by_area.items():
                         token = (int(episode_idx), int(round_num), area_key)
@@ -1039,6 +1259,10 @@ class EvalStatsCallback(BaseCallback):
                         wasted = int(stats.get("wasted", 0))
                         waste_area_counts[area_key] = (
                             waste_area_counts.get(area_key, 0) + wasted
+                        )
+                        resolution_total_counts[area_key] = (
+                            resolution_total_counts.get(area_key, 0)
+                            + int(stats.get("total", 0))
                         )
                         waste_total += wasted
                 total_steps += 1
@@ -1073,8 +1297,49 @@ class EvalStatsCallback(BaseCallback):
 
         for area_key, count in marker_area_counts.items():
             self.logger.record(f"eval/marker_placed/{area_key}", count)
+
+        tracked_areas = set(marker_area_counts.keys()) | set(opportunity_area_counts.keys())
+        for area_key in sorted(tracked_areas):
+            markers = int(marker_area_counts.get(area_key, 0))
+            opportunities = int(opportunity_area_counts.get(area_key, 0))
+            self.logger.record(f"eval/marker_opportunities/{area_key}", opportunities)
+            if markers > 0:
+                self.logger.record(
+                    f"eval/marker_to_opportunity_ratio/{area_key}",
+                    opportunities / markers,
+                )
+
+        reward_areas = set(reward_by_area.keys()) | set(marker_area_counts.keys())
+        for area_key in sorted(reward_areas):
+            markers = int(marker_area_counts.get(area_key, 0))
+            reward_sum = float(reward_by_area.get(area_key, 0.0))
+            self.logger.record(f"eval/reward_by_marker_area/{area_key}", reward_sum)
+            if markers > 0:
+                self.logger.record(
+                    f"eval/reward_yield_per_marker/{area_key}",
+                    reward_sum / markers,
+                )
+
         for area_key, count in waste_area_counts.items():
             self.logger.record(f"eval/wasted_markers/{area_key}", count)
+            total_markers = resolution_total_counts.get(area_key, 0)
+            self.logger.record(f"eval/resolution_markers_total/{area_key}", total_markers)
+            if total_markers > 0:
+                self.logger.record(
+                    f"eval/wasted_marker_rate/{area_key}",
+                    count / total_markers,
+                )
+            actionable = max(0, int(total_markers) - int(count))
+            opportunities = int(opportunity_area_counts.get(area_key, 0))
+            avoidable_est = max(0, actionable - opportunities)
+            self.logger.record(f"eval/waste_unavoidable/{area_key}", int(count))
+            self.logger.record(f"eval/waste_actionable_marker_pool/{area_key}", actionable)
+            self.logger.record(f"eval/waste_avoidable_est/{area_key}", avoidable_est)
+            if actionable > 0:
+                self.logger.record(
+                    f"eval/waste_avoidable_rate_est/{area_key}",
+                    avoidable_est / actionable,
+                )
         self.logger.record("eval/wasted_markers_total", waste_total)
 
     def _on_step(self) -> bool:

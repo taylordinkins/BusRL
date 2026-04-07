@@ -166,6 +166,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
         refresh_every_n_episodes: int = 5,
         max_policy_cache_size: int = 8,
         log_self_play_checkpoint: bool = False,
+        update_win_rate_stats: bool = True,
     ):
         """Initialize the multi-policy wrapper.
 
@@ -201,6 +202,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
         self._episodes_since_refresh = 0
         self.max_policy_cache_size = max(0, int(max_policy_cache_size))
         self.log_self_play_checkpoint = bool(log_self_play_checkpoint)
+        self.update_win_rate_stats = bool(update_win_rate_stats)
 
         # Policy assignments for each player slot
         self._policy_slots: list[PolicySlot] = []
@@ -221,6 +223,10 @@ class MultiPolicyBusEnv(gym.Wrapper):
 
         # Track game outcomes for Elo updates
         self._current_episode_checkpoints: list[str] = []
+        # Track per-round waste tokens so each (round, area) is counted once per episode
+        self._telemetry_seen_waste_rounds: set[tuple[int, str]] = set()
+        # Track per-slot opportunity tokens so each marker slot opportunity is counted once
+        self._telemetry_seen_opportunity_slots: set[tuple[int, str, str, int]] = set()
 
     @property
     def training_policy(self) -> Optional["MaskablePPO"]:
@@ -251,6 +257,8 @@ class MultiPolicyBusEnv(gym.Wrapper):
             Tuple of (observation, info) from training player's perspective.
         """
         obs, info = self.env.reset(seed=seed, options=options)
+        self._telemetry_seen_waste_rounds = set()
+        self._telemetry_seen_opportunity_slots = set()
 
         # For subprocess environments, refresh the opponent pool from disk
         # to pick up new checkpoints saved by the main training process.
@@ -316,8 +324,11 @@ class MultiPolicyBusEnv(gym.Wrapper):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info).
         """
+        telemetry = self._new_step_telemetry()
+
         # Execute training policy's action
         obs, reward, terminated, truncated, info = self.env.step(action)
+        self._accumulate_step_telemetry(telemetry, info, float(reward))
 
         # Track acting player for reward attribution
         acting_player = self.training_slot
@@ -326,7 +337,11 @@ class MultiPolicyBusEnv(gym.Wrapper):
         # Handle opponent turns until game ends or training player's turn
         if not (terminated or truncated):
             terminated_before_opp = False
-            obs, info, term_during_opp, trunc_during_opp, opp_rewards = self._handle_opponent_turns(obs, info)
+            obs, info, term_during_opp, trunc_during_opp, opp_rewards = self._handle_opponent_turns(
+                obs,
+                info,
+                telemetry,
+            )
             
             # Update terminal/truncated flags
             terminated = terminated or term_during_opp
@@ -357,6 +372,13 @@ class MultiPolicyBusEnv(gym.Wrapper):
         info["acting_player"] = acting_player
         info["opponent_checkpoints"] = self._current_episode_checkpoints
         info["cumulative_reward"] = cumulative_reward
+        info["telemetry_head_counts"] = telemetry["head_counts"]
+        info["telemetry_marker_counts"] = telemetry["marker_counts"]
+        info["telemetry_wasted_counts"] = telemetry["wasted_counts"]
+        info["telemetry_resolution_totals"] = telemetry["resolution_totals"]
+        info["telemetry_opportunity_counts"] = telemetry["opportunity_counts"]
+        info["telemetry_reward_by_area"] = telemetry["reward_by_area"]
+        info["telemetry_internal_steps"] = telemetry["internal_steps"]
 
         return obs, cumulative_reward, terminated, truncated, info
 
@@ -615,13 +637,15 @@ class MultiPolicyBusEnv(gym.Wrapper):
         Returns:
             Updated (observation, info) when it's training player's turn.
         """
-        obs, info, _, _, _ = self._handle_opponent_turns(obs, info)
+        telemetry = self._new_step_telemetry()
+        obs, info, _, _, _ = self._handle_opponent_turns(obs, info, telemetry)
         return obs, info
 
     def _handle_opponent_turns(
         self,
         obs: np.ndarray,
         info: dict,
+        telemetry: Optional[dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, dict, bool, bool, float]:
         """Execute opponent turns until training player's turn or game end.
 
@@ -708,12 +732,113 @@ class MultiPolicyBusEnv(gym.Wrapper):
 
             # Execute action (either from policy or NOOP)
             obs, opp_reward, terminated, truncated, info = self.env.step(action)
+            if telemetry is not None:
+                self._accumulate_step_telemetry(telemetry, info, float(opp_reward))
             total_opponent_reward += opp_reward
 
             if terminated or truncated:
                 break
 
         return obs, info, terminated, truncated, total_opponent_reward
+
+    @staticmethod
+    def _new_step_telemetry() -> dict[str, Any]:
+        return {
+            "head_counts": {},
+            "marker_counts": {},
+            "wasted_counts": {},
+            "resolution_totals": {},
+            "opportunity_counts": {},
+            "reward_by_area": {},
+            "internal_steps": 0,
+        }
+
+    @staticmethod
+    def _head_id_to_area(head_id: Optional[int]) -> Optional[str]:
+        if head_id == 4:
+            return "line_expansion"
+        if head_id == 5:
+            return "passengers"
+        if head_id == 6:
+            return "buildings"
+        if head_id == 7:
+            return "time_clock"
+        if head_id in (8, 9):
+            return "vrroomm"
+        return None
+
+    def _accumulate_step_telemetry(
+        self,
+        telemetry: dict[str, Any],
+        info: dict[str, Any],
+        step_reward: float,
+    ) -> None:
+        telemetry["internal_steps"] = int(telemetry.get("internal_steps", 0)) + 1
+
+        head_id = info.get("action_head_id", info.get("head_id"))
+        if head_id is not None:
+            key = str(head_id)
+            telemetry["head_counts"][key] = int(telemetry["head_counts"].get(key, 0)) + 1
+
+        placed_area = info.get("placed_marker_area")
+        if placed_area:
+            telemetry["marker_counts"][placed_area] = int(
+                telemetry["marker_counts"].get(placed_area, 0)
+            ) + 1
+
+        resolution_area = info.get("resolution_area")
+        resolution_slot_label = info.get("resolution_slot_label")
+        resolution_slot_player = info.get("resolution_slot_player")
+        round_num = info.get("round")
+        valid_action_count = int(info.get("valid_action_count", 0) or 0)
+        if (
+            resolution_area
+            and resolution_slot_label is not None
+            and resolution_slot_player is not None
+            and round_num is not None
+            and valid_action_count > 0
+        ):
+            opp_token = (
+                int(round_num),
+                str(resolution_area),
+                str(resolution_slot_label),
+                int(resolution_slot_player),
+            )
+            if opp_token not in self._telemetry_seen_opportunity_slots:
+                self._telemetry_seen_opportunity_slots.add(opp_token)
+                telemetry["opportunity_counts"][str(resolution_area)] = int(
+                    telemetry["opportunity_counts"].get(str(resolution_area), 0)
+                ) + 1
+
+        head_id_raw = info.get("action_head_id", info.get("head_id"))
+        head_id = None
+        try:
+            if head_id_raw is not None:
+                head_id = int(head_id_raw)
+        except (TypeError, ValueError):
+            head_id = None
+        reward_area = self._head_id_to_area(head_id)
+        if reward_area is not None:
+            telemetry["reward_by_area"][reward_area] = float(
+                telemetry["reward_by_area"].get(reward_area, 0.0)
+            ) + float(step_reward)
+
+        waste_by_area = info.get("resolution_waste_by_area")
+        if waste_by_area and round_num is not None:
+            for area_key, stats in waste_by_area.items():
+                token = (int(round_num), area_key)
+                if token in self._telemetry_seen_waste_rounds:
+                    continue
+                self._telemetry_seen_waste_rounds.add(token)
+
+                wasted = int(stats.get("wasted", 0))
+                total = int(stats.get("total", 0))
+                telemetry["wasted_counts"][area_key] = int(
+                    telemetry["wasted_counts"].get(area_key, 0)
+                ) + wasted
+                telemetry["resolution_totals"][area_key] = int(
+                    telemetry["resolution_totals"].get(area_key, 0)
+                ) + total
 
     # def _update_elo_ratings(self, info: dict) -> None:
     #     """Update Elo ratings after a game ends.
@@ -840,8 +965,12 @@ class MultiPolicyBusEnv(gym.Wrapper):
         training_seat = self.training_slot
         training_score = final_scores[training_seat]
 
-        # Keep a running tally for seat-averaged win rate
-        seat_win_counts = {pid: [] for pid in player_ids if pid not in ("__current__", "__training_subprocess__")}
+        # Keep a running tally for seat-averaged win rate per checkpoint.
+        # In multiplayer games, the same checkpoint can occupy multiple seats.
+        seat_win_counts = {
+            pid: [] for pid in player_ids if pid not in ("__current__", "__training_subprocess__")
+        }
+        seat_games_count = {pid: 0 for pid in seat_win_counts}
 
         # 2) Update opponent pool stats per opponent seat
         for seat, checkpoint_id in enumerate(player_ids):
@@ -868,24 +997,20 @@ class MultiPolicyBusEnv(gym.Wrapper):
             # Track per-seat results
             seat_win_counts[checkpoint_id].append(win)
 
-            # Update opponent pool with this seat's win rate (single sample)
+            seat_games_count[checkpoint_id] = seat_games_count.get(checkpoint_id, 0) + 1
+
+        # 3) Write a single averaged update per checkpoint to avoid noisy overwrites.
+        for checkpoint_id, wins in seat_win_counts.items():
+            games_delta = seat_games_count.get(checkpoint_id, 0)
+            if games_delta <= 0:
+                continue
+            avg_win_rate = sum(wins) / games_delta
             self.opponent_pool.update_checkpoint_stats(
                 checkpoint_id=checkpoint_id,
-                win_rate=win,
+                win_rate=(avg_win_rate if self.update_win_rate_stats else None),
                 elo=self.elo_tracker.get_rating(checkpoint_id),
-                games_played_delta=1,
+                games_played_delta=games_delta,
             )
-
-        # # 3) Compute seat-averaged win rates for each checkpoint
-        # for checkpoint_id, wins in seat_win_counts.items():
-        #     avg_win_rate = sum(wins) / len(wins) if wins else 0.0
-        #     self.opponent_pool.update_checkpoint_stats(
-        #         checkpoint_id=checkpoint_id,
-        #         win_rate=avg_win_rate,
-        #         # Keep Elo unchanged here (already updated)
-        #         elo=self.elo_tracker.get_rating(checkpoint_id),
-        #         games_played_delta=0,  # Do not double-count games
-        #     )
 
 
 
@@ -983,8 +1108,10 @@ class MatchRunner:
             "wins_b": wins_b,
             "draws": draws,
             "total_games": n_games,
-            "win_rate_a": wins_a / n_games if n_games > 0 else 0.5,
-            "win_rate_b": wins_b / n_games if n_games > 0 else 0.5,
+            "points_a": wins_a + 0.5 * draws,
+            "points_b": wins_b + 0.5 * draws,
+            "win_rate_a": (wins_a + 0.5 * draws) / n_games if n_games > 0 else 0.5,
+            "win_rate_b": (wins_b + 0.5 * draws) / n_games if n_games > 0 else 0.5,
             "avg_score_a": total_scores_a / n_games if n_games > 0 else 0,
             "avg_score_b": total_scores_b / n_games if n_games > 0 else 0,
         }
