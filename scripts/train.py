@@ -255,7 +255,7 @@ def train(args):
                         elo_tracker=None,  # Subprocesses don't update ratings
                         randomize_training_slot=_randomize_training_slot,
                         self_play_checkpoint_path=self_play_checkpoint,
-                        refresh_every_n_episodes=5,
+                        refresh_every_n_episodes=2,
                         log_self_play_checkpoint=_log_self_play_checkpoint,
                         update_win_rate_stats=(_skill_tracking != "openskill"),
                     )
@@ -598,7 +598,7 @@ if __name__ == "__main__":
                         help="Save frequency")
     parser.add_argument("--eval_freq", type=int, default=10_000,
                         help="Eval frequency")
-    parser.add_argument("--n_eval_episodes", type=int, default=5,
+    parser.add_argument("--n_eval_episodes", type=int, default=20,
                         help="Number of eval episodes")
     parser.add_argument("--device", type=str, default="auto",
                         help="torch device")

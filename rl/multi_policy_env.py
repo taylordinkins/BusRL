@@ -695,16 +695,16 @@ class MultiPolicyBusEnv(gym.Wrapper):
                 warnings.warn(
                     f"Failed to compute action mask for opponent turn "
                     f"(error: {type(exc).__name__}: {exc}). "
-                    "Falling back to NOOP for auto-advance."
+                    "Falling back to action index 0 for auto-advance."
                 )
 
             # Check if we're in a state that should auto-advance
             # During RESOLVING_ACTIONS or CLEANUP, if there are no valid actions,
-            # we should use NOOP to trigger auto-advance instead of asking the policy
+            # use action index 0 to trigger auto-advance instead of asking the policy.
             should_use_noop = False
             if action_mask is None:
                 should_use_noop = True
-                action = self.env.unwrapped._action_config.noop_idx
+                action = 0
             elif not np.any(action_mask):
                 # No valid actions - check if this is expected
                 if current_phase in (Phase.RESOLVING_ACTIONS, Phase.CLEANUP):
@@ -712,7 +712,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
                     # no valid actions (e.g., marker placed too far behind in queue,
                     # no passengers to deliver, etc.). Use NOOP to trigger auto-advance.
                     should_use_noop = True
-                    action = self.env.unwrapped._action_config.noop_idx
+                    action = 0
                 else:
                     # Unexpected empty mask during player decision phase
                     import warnings
@@ -722,7 +722,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
                     )
                     # Try NOOP as fallback
                     should_use_noop = True
-                    action = self.env.unwrapped._action_config.noop_idx
+                    action = 0
 
             # If not using NOOP, get action from opponent policy
             if not should_use_noop:

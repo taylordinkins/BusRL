@@ -6,25 +6,25 @@ python scripts/train.py \
     --pool_save_interval 10000 \
     --pool_eval_interval 50000 \
     --total_timesteps 5000000 \
-    --ent_coef 0.1 \
-    --ent_coef_final 0.02 \
+    --ent_coef 0.07 \
+    --ent_coef_final 0.01 \
     --n_envs 16 \
     --n_steps 512 \
     --batch_size 1024 \
     --target_kl 0.02 \
     --lr 3e-4 \
     --pool_eval_opponents 10 \
-    --pool_eval_games 10 \
-    --prune_strategy lowest_elo \
+    --pool_eval_games 20 \
+    --prune_strategy least_diverse \
     --multi_policy \
-    --self_play_prob 0.2 \
+    --self_play_prob 0.45 \
     --randomize_training_slot \
     --disable_dist_validate \
     --diag_log_interval 100000 \
     --diag_log_samples 256 \
     --diag_log_tolerance 5e-5 \
     --skill_tracking openskill \
-    --skill_temperature 200 \
+    --skill_temperature 30 \
     --pl_tau 30.0 \
     --sampling_method elo_weighted
     # --load_pool_dir logs/ppo_bus_20260126_194851/opponent_pool \

@@ -36,6 +36,7 @@ class StepRewardInfo:
     time_stone_penalty: float = 0.0
     marker_opportunity_bonus: float = 0.0
     avoidable_waste_penalty: float = 0.0
+    resolve_progress_bonus: float = 0.0
     terminal_reward: float = 0.0
 
     @property
@@ -50,6 +51,7 @@ class StepRewardInfo:
             + self.time_stone_penalty
             + self.marker_opportunity_bonus
             + self.avoidable_waste_penalty
+            + self.resolve_progress_bonus
             + self.terminal_reward
         )
 
@@ -160,6 +162,10 @@ class RewardCalculator:
         info.marker_opportunity_bonus = marker_bonus
         info.avoidable_waste_penalty = waste_penalty
 
+        # Tiny shaping during resolve heads to encourage conversion of placed
+        # markers into concrete progress, with conservative downstream weights.
+        info.resolve_progress_bonus = self._compute_resolution_progress_bonus(action_info)
+
         # Terminal reward
         if done:
             info.terminal_reward = self._compute_terminal_reward(state, player_id)
@@ -199,6 +205,27 @@ class RewardCalculator:
         if actionable:
             return float(self.config.marker_opportunity_bonus), 0.0
         return 0.0, float(self.config.avoidable_waste_penalty)
+
+    def _compute_resolution_progress_bonus(
+        self,
+        action_info: Optional[dict],
+    ) -> float:
+        """Compute tiny shaping bonuses for marker resolution actions.
+
+        Bonuses are intentionally small to avoid overpowering sparse strategic
+        rewards and to reduce incentive for harmful downstream setups.
+        """
+        if not action_info:
+            return 0.0
+
+        action_type = action_info.get("action_type")
+        if action_type == "RESOLVE_LINE_EXPANSION":
+            return float(self.config.resolve_line_expansion_bonus)
+        if action_type == "RESOLVE_PASSENGERS":
+            return float(self.config.resolve_passengers_bonus)
+        if action_type == "RESOLVE_BUILDINGS":
+            return float(self.config.resolve_buildings_bonus)
+        return 0.0
 
     def _projected_max_buses_for_area(self, state: "GameState", area: str) -> int:
         """Compute M#oB used for marker-shaping estimates.

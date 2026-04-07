@@ -292,6 +292,11 @@ class RewardConfig:
     marker_opportunity_bonus: float = 0.02
     avoidable_waste_penalty: float = -0.02
 
+    # Resolve-phase shaping (tiny progression incentives)
+    resolve_line_expansion_bonus: float = 0.005
+    resolve_passengers_bonus: float = 0.001
+    resolve_buildings_bonus: float = 0.001
+
     # Terminal rewards use point differential (no config needed)
 
     # Add a "Won Game Reward"
