@@ -2,17 +2,17 @@
 
 python scripts/train.py \
     --use_opponent_pool \
-    --pool_size 100 \
-    --pool_save_interval 5000 \
-    --pool_eval_interval 10000 \
+    --pool_size 50 \
+    --pool_save_interval 10000 \
+    --pool_eval_interval 50000 \
     --total_timesteps 5000000 \
     --ent_coef 0.1 \
-    --ent_coef_final 0.01 \
+    --ent_coef_final 0.02 \
     --n_envs 16 \
     --n_steps 512 \
     --batch_size 1024 \
     --target_kl 0.02 \
-    --lr 1e-4 \
+    --lr 3e-4 \
     --pool_eval_opponents 10 \
     --pool_eval_games 10 \
     --prune_strategy lowest_elo \

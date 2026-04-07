@@ -20,6 +20,7 @@ except ImportError:
     import gym
 
 from stable_baselines3.common.callbacks import BaseCallback
+from sb3_contrib.common.maskable.utils import get_action_masks
 
 if TYPE_CHECKING:
     from .opponent_pool import OpponentPool
@@ -902,3 +903,104 @@ class HeadUsageCallback(BaseCallback):
                 self.logger.record(f"rollout/head_usage_pct/{key}", count / total)
 
         self._counts = {head: 0 for head in HeadId}
+
+
+class EvalStatsCallback(BaseCallback):
+    """Run periodic eval episodes and log score diff + head usage."""
+
+    def __init__(
+        self,
+        eval_env,
+        eval_freq: int,
+        n_eval_episodes: int = 5,
+        deterministic: bool = True,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_freq = max(1, int(eval_freq))
+        self.n_eval_episodes = max(1, int(n_eval_episodes))
+        self.deterministic = bool(deterministic)
+        self._label_map = {
+            HeadId.SETUP_BUILDINGS: "setup_bld",
+            HeadId.SETUP_RAILS_FORWARD: "setup_rf",
+            HeadId.SETUP_RAILS_REVERSE: "setup_rr",
+            HeadId.CHOOSING_ACTIONS: "choose",
+            HeadId.RESOLVE_LINE_EXPANSION: "lineexp",
+            HeadId.RESOLVE_PASSENGERS: "passeng",
+            HeadId.RESOLVE_BUILDINGS: "build",
+            HeadId.RESOLVE_TIME_CLOCK: "clock",
+            HeadId.RESOLVE_VRROOMM_PASSENGER: "vr_pax",
+            HeadId.RESOLVE_VRROOMM_DEST: "vr_dst",
+        }
+
+    def _run_eval(self) -> None:
+        score_diffs: list[float] = []
+        head_counts = {head: 0 for head in HeadId}
+        total_steps = 0
+
+        for _ in range(self.n_eval_episodes):
+            obs, _ = self.eval_env.reset()
+            terminated = False
+            truncated = False
+
+            while not (terminated or truncated):
+                masks = get_action_masks(self.eval_env)
+                action, _ = self.model.predict(
+                    obs, action_masks=masks, deterministic=self.deterministic
+                )
+                obs, rewards, dones, truncs, infos = self.eval_env.step(action)
+                terminated = bool(dones[0])
+                truncated = bool(truncs[0])
+
+                info = infos[0]
+                head_id = info.get("head_id")
+                if head_id is not None:
+                    if isinstance(head_id, str):
+                        try:
+                            head_id = HeadId[head_id]
+                        except KeyError:
+                            head_id = None
+                    elif isinstance(head_id, int):
+                        try:
+                            head_id = HeadId(head_id)
+                        except ValueError:
+                            head_id = None
+                if isinstance(head_id, HeadId):
+                    head_counts[head_id] += 1
+                total_steps += 1
+
+            # End of episode: compute score diff using score - time_stones
+            final_info = infos[0]
+            scores = final_info.get("scores", {})
+            time_stones = final_info.get("time_stones", {})
+            if scores:
+                final_scores = [
+                    scores[p_id] - time_stones.get(p_id, 0) for p_id in scores.keys()
+                ]
+                final_scores.sort(reverse=True)
+                if len(final_scores) >= 2:
+                    score_diffs.append(final_scores[0] - final_scores[1])
+                else:
+                    score_diffs.append(0.0)
+
+        if self.logger is None:
+            return
+
+        if score_diffs:
+            self.logger.record("eval/score_diff_top2", float(np.mean(score_diffs)))
+
+        for head, count in head_counts.items():
+            short = f"h{head.value}"
+            label = self._label_map.get(head, head.name)
+            key = f"{short}_{label}"
+            self.logger.record(f"eval/head_usage/{key}", count)
+            if total_steps > 0:
+                self.logger.record(f"eval/head_usage_pct/{key}", count / total_steps)
+
+    def _on_step(self) -> bool:
+        if self.eval_freq <= 0:
+            return True
+        if self.num_timesteps % self.eval_freq == 0:
+            self._run_eval()
+        return True

@@ -81,6 +81,7 @@ These items aren’t blockers but can increase clarity and debug-ability:
 - Log `head_id` and `vrroomm_stage` in `info` (already done).
 - Head usage now logs labeled keys (e.g., `h3_choose`) and prints a legend at training start.
 - Track tie rate explicitly once OpenSkill evaluation is adjusted.
+- MultiPolicy fallback still references legacy NOOP index for rare empty-mask cases. It should never trigger under the new resolver flow, but if it does, it would be an invalid index with the 216 action space. Consider replacing with a safe valid-action fallback if it ever appears in logs.
 
 ---
 

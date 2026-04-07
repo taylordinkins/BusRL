@@ -44,6 +44,7 @@ from rl.callbacks import (
     TrueEpisodeLengthCallback,
     DiagnosticMaskingCallback,
     HeadUsageCallback,
+    EvalStatsCallback,
 )
 from rl.policies import BusMaskableActorCriticPolicy
 
@@ -353,6 +354,14 @@ def train(args):
         render=False,
     )
     callbacks.append(eval_callback)
+    eval_stats_callback = EvalStatsCallback(
+        eval_env=eval_env,
+        eval_freq=args.eval_freq // args.n_envs,
+        n_eval_episodes=args.n_eval_episodes,
+        deterministic=True,
+        verbose=0,
+    )
+    callbacks.append(eval_stats_callback)
 
     # Diagnostic masking callback (low-frequency)
     if args.diag_log_interval > 0:
