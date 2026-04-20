@@ -33,6 +33,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from rl.bus_env import BusEnv
+from rl.config import ObservationConfig
 from rl.wrappers import BusEnvSelfPlayWrapper
 from rl.opponent_pool import OpponentPool, PoolConfig
 from rl.elo_tracker import EloTracker
@@ -60,8 +61,10 @@ from rl.policies import BusMaskableActorCriticPolicy
 ##########
 
 
-def make_base_env(num_players: int) -> BusEnv:
+def make_base_env(num_players: int, obs_config: ObservationConfig = None) -> BusEnv:
     """Create a base BusEnv instance."""
+    if obs_config is not None:
+        return BusEnv(num_players=num_players, obs_config=obs_config)
     return BusEnv(num_players=num_players)
 
 
@@ -119,6 +122,16 @@ def train(args):
     if args.disable_dist_validate:
         # Disable debug-only distribution validation to avoid Simplex drift
         torch.distributions.Distribution.set_default_validate_args(False)
+
+    # Build observation config (use_slot_actionability is opt-in to preserve
+    # checkpoint compatibility — see waste_management.md Proposal 4)
+    obs_config = ObservationConfig(
+        use_slot_actionability=args.use_slot_actionability,
+    )
+    if args.use_slot_actionability:
+        print(f"Per-slot actionability feature ENABLED — obs dim: {obs_config.total_observation_dim}")
+    else:
+        print(f"Observation dim: {obs_config.total_observation_dim}")
 
     # Create base log directory
     os.makedirs("logs", exist_ok=True)
@@ -179,7 +192,11 @@ def train(args):
 
         # Prime fresh pool from an existing one if requested
         if args.load_pool_dir and args.start_fresh_directory:
-            n_primed = opponent_pool.prime_from_pool(args.load_pool_dir)
+            n_primed = opponent_pool.prime_from_pool(
+                args.load_pool_dir,
+                n_top=args.prime_n_top,
+                n_random=args.prime_n_random,
+            )
             print(f"  Primed {n_primed} checkpoints from {args.load_pool_dir}")
 
         if len(opponent_pool) > 0:
@@ -210,6 +227,7 @@ def train(args):
         """
         # Capture these values for the closure (simple picklable values)
         _num_players = args.num_players
+        _obs_config = obs_config
         _multi_policy = args.multi_policy
         _self_play_prob = args.self_play_prob
         _sampling_method = args.sampling_method
@@ -228,7 +246,7 @@ def train(args):
                 import torch
                 torch.set_num_threads(1)
 
-            env = BusEnv(num_players=_num_players)
+            env = BusEnv(num_players=_num_players, obs_config=_obs_config)
 
             # For training with multi-policy mode, wrap with MultiPolicyBusEnv
             if _multi_policy and _pool_dir is not None and not is_eval:
@@ -361,6 +379,7 @@ def train(args):
         eval_freq=max(1, args.eval_freq),
         n_eval_episodes=args.n_eval_episodes,
         deterministic=True,
+        debug_waste_log_path=args.waste_debug_log if args.waste_debug_log else None,
         verbose=0,
     )
     callbacks.append(eval_stats_callback)
@@ -407,7 +426,7 @@ def train(args):
 
         # Pool evaluation callback (actual head-to-head matches)
         if args.pool_eval_interval > 0:
-            env_factory = partial(make_base_env, args.num_players)
+            env_factory = partial(make_base_env, args.num_players, obs_config)
             pool_eval_callback = OpponentPoolEvalCallback(
                 opponent_pool=opponent_pool,
                 elo_tracker=elo_tracker,
@@ -568,6 +587,14 @@ if __name__ == "__main__":
                         help="Number of players in game")
     parser.add_argument("--n_envs", type=int, default=4,
                         help="Number of parallel environments")
+    parser.add_argument("--use-slot-actionability", action="store_true",
+                        help="Add per-slot is_actionable feature to observation "
+                             "(Proposal 4). Increases obs dim by 42. Incompatible "
+                             "with checkpoints trained without this flag.")
+    parser.add_argument("--waste-debug-log", type=str, default=None,
+                        help="If set, write per-slot resolution detail to this "
+                             "path (JSON lines) during eval runs for waste metric "
+                             "verification (Proposal 5).")
 
     # Training args
     parser.add_argument("--total_timesteps", type=int, default=1_000_000,
@@ -625,7 +652,11 @@ if __name__ == "__main__":
     parser.add_argument("--load_pool_dir", type=str, default=None,
                         help="Path to existing opponent pool directory to continue from (e.g., logs/ppo_bus_20260122_123456/opponent_pool)")
     parser.add_argument("--start_fresh_directory", action="store_true",
-                        help="Start a fresh opponent pool instead of saving into --load_pool_dir. Primes the new pool with top 3 by Elo + 2 random checkpoints from --load_pool_dir")
+                        help="Start a fresh opponent pool instead of saving into --load_pool_dir. Primes the new pool from --load_pool_dir using --prime_n_top and --prime_n_random")
+    parser.add_argument("--prime_n_top", type=int, default=15,
+                        help="Number of highest-Elo checkpoints to copy when priming a fresh pool (requires --start_fresh_directory)")
+    parser.add_argument("--prime_n_random", type=int, default=10,
+                        help="Number of additional randomly sampled checkpoints to copy when priming a fresh pool (requires --start_fresh_directory)")
     parser.add_argument("--pool_size", type=int, default=20,
                         help="Max checkpoints in opponent pool")
     parser.add_argument("--pool_save_interval", type=int, default=10000,

@@ -320,18 +320,50 @@ class ObservationEncoder:
 
         return offset + self.config.player_features_size
 
+    def _projected_max_buses_for_obs(self, state: GameState, area_type: ActionAreaType) -> int:
+        """Compute projected M#oB for the is_actionable slot feature.
+
+        Mirrors reward.py:RewardCalculator._projected_max_buses_for_area() but
+        operates directly on the area enum rather than its string value.
+        LINE_EXPANSION excludes the pending Buses gain; PASSENGERS/BUILDINGS
+        include it if a bus can be gained from the Buses resolution slot.
+        """
+        current_max = max(p.buses for p in state.players)
+
+        if area_type == ActionAreaType.LINE_EXPANSION:
+            return current_max
+
+        if area_type not in (ActionAreaType.PASSENGERS, ActionAreaType.BUILDINGS):
+            return current_max
+
+        buses_markers = state.action_board.get_markers_to_resolve(ActionAreaType.BUSES)
+        if not buses_markers:
+            return current_max
+
+        bus_slot = buses_markers[0]
+        player = state.get_player(bus_slot.player_id)
+        if not player.can_gain_bus():
+            return current_max
+
+        return max(current_max, player.buses + 1)
+
     def _encode_action_board(
         self, state: GameState, current_player_id: int, obs: np.ndarray, offset: int
     ) -> int:
         """Encode action board features into observation tensor.
 
-        Action board features (4 per slot, 6 slots per area, 7 areas):
+        Action board features per slot (6 slots per area, 7 areas):
         - is_occupied (1): binary
         - occupying_player_relative_idx (1): normalized [-1=empty, 0-4=player]
         - is_current_player (1): binary
         - placement_order (1): normalized
+        - is_actionable (1, optional): binary; 1 iff (projected_M#oB - slot_index) > 0
+          Only populated for M#oB-scaled areas (line_expansion, passengers, buildings)
+          when obs_config.use_slot_actionability is True. Zero-padded otherwise.
         """
-        feature_dim = self.config.SLOT_FEATURE_DIM
+        feature_dim = self.config.slot_feature_dim
+        use_actionability = self.config.use_slot_actionability
+        moob_areas = (ActionAreaType.LINE_EXPANSION, ActionAreaType.PASSENGERS, ActionAreaType.BUILDINGS)
         num_players = state.num_players()
         player_order = self._get_player_order(current_player_id, num_players)
 
@@ -348,6 +380,11 @@ class ObservationEncoder:
             area = state.action_board.areas.get(area_type)
             if area is None:
                 continue
+
+            # Compute projected M#oB for this area once (only needed for M#oB areas)
+            projected_max_buses = 0
+            if use_actionability and area_type in moob_areas:
+                projected_max_buses = self._projected_max_buses_for_obs(state, area_type)
 
             # Get slots in label order (A, B, C, D, E, F)
             slot_labels = sorted(area.slots.keys())
@@ -384,6 +421,14 @@ class ObservationEncoder:
                 else:
                     obs[base + i] = 0.0
                 i += 1
+
+                # is_actionable (optional feature, index 4)
+                if use_actionability:
+                    if area_type in moob_areas:
+                        obs[base + i] = 1.0 if (projected_max_buses - slot_idx) > 0 else 0.0
+                    else:
+                        obs[base + i] = 0.0
+                    i += 1
 
         return offset + self.config.action_board_size
 

@@ -152,3 +152,4 @@ logs/
 checkpoints/
 .antigravity/
 .gemini/
+*.jsonl

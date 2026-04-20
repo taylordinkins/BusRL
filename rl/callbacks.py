@@ -1124,6 +1124,7 @@ class EvalStatsCallback(BaseCallback):
         eval_freq: int,
         n_eval_episodes: int = 5,
         deterministic: bool = True,
+        debug_waste_log_path: Optional[str] = None,
         verbose: int = 0,
     ) -> None:
         super().__init__(verbose)
@@ -1131,6 +1132,9 @@ class EvalStatsCallback(BaseCallback):
         self.eval_freq = max(1, int(eval_freq))
         self.n_eval_episodes = max(1, int(n_eval_episodes))
         self.deterministic = bool(deterministic)
+        # When provided, write per-slot resolution detail for every eval episode
+        # to this path (JSON lines, one object per resolution event).
+        self.debug_waste_log_path = debug_waste_log_path
         self._label_map = {
             HeadId.SETUP_BUILDINGS: "setup_bld",
             HeadId.SETUP_RAILS_FORWARD: "setup_rf",
@@ -1156,6 +1160,9 @@ class EvalStatsCallback(BaseCallback):
         waste_total = 0
         seen_waste_rounds: set[tuple[int, str]] = set()
         seen_opportunity_slots: set[tuple[int, int, str, str, int]] = set()
+        _debug_records: list[dict] = []
+        _slot_label_to_index = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
+        _moob_areas = {"line_expansion", "passengers", "buildings"}
 
         for episode_idx in range(self.n_eval_episodes):
             reset_out = self.eval_env.reset()
@@ -1265,6 +1272,37 @@ class EvalStatsCallback(BaseCallback):
                             + int(stats.get("total", 0))
                         )
                         waste_total += wasted
+
+                # Debug: per-slot resolution detail for waste metric verification
+                if (
+                    self.debug_waste_log_path
+                    and resolution_area in _moob_areas
+                    and resolution_slot_label is not None
+                    and resolution_slot_player is not None
+                    and round_num is not None
+                ):
+                    slot_idx = _slot_label_to_index.get(str(resolution_slot_label).upper(), -1)
+                    area_waste_stats = (waste_by_area or {}).get(str(resolution_area), {})
+                    max_buses = area_waste_stats.get("max_buses", -1)
+                    is_type1_wasted = (
+                        slot_idx >= 0 and max_buses >= 0 and (max_buses - slot_idx) <= 0
+                    )
+                    _debug_records.append({
+                        "step": self.num_timesteps,
+                        "episode": episode_idx,
+                        "round": int(round_num),
+                        "area": str(resolution_area),
+                        "slot": str(resolution_slot_label),
+                        "slot_index": slot_idx,
+                        "player": resolution_slot_player,
+                        "max_buses": max_buses,
+                        "valid_action_count": valid_action_count,
+                        "is_type1_wasted": is_type1_wasted,
+                        "is_type2_candidate": (
+                            not is_type1_wasted and valid_action_count == 0
+                        ),
+                    })
+
                 total_steps += 1
 
             # End of episode: compute score diff using score - time_stones
@@ -1280,6 +1318,13 @@ class EvalStatsCallback(BaseCallback):
                     score_diffs.append(final_scores[0] - final_scores[1])
                 else:
                     score_diffs.append(0.0)
+
+        # Write per-slot resolution debug records if requested
+        if self.debug_waste_log_path and _debug_records:
+            os.makedirs(os.path.dirname(self.debug_waste_log_path) or ".", exist_ok=True)
+            with open(self.debug_waste_log_path, "a") as _f:
+                for _rec in _debug_records:
+                    _f.write(json.dumps(_rec) + "\n")
 
         if self.logger is None:
             return

@@ -37,6 +37,8 @@ class StepRewardInfo:
     marker_opportunity_bonus: float = 0.0
     avoidable_waste_penalty: float = 0.0
     resolve_progress_bonus: float = 0.0
+    # Resolution-time Type 1 waste penalty (injected by BusEnv, not RewardCalculator)
+    resolution_waste_penalty: float = 0.0
     terminal_reward: float = 0.0
 
     @property
@@ -52,6 +54,7 @@ class StepRewardInfo:
             + self.marker_opportunity_bonus
             + self.avoidable_waste_penalty
             + self.resolve_progress_bonus
+            + self.resolution_waste_penalty
             + self.terminal_reward
         )
 

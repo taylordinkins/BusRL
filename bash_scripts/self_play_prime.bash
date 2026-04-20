@@ -11,7 +11,7 @@ python scripts/train.py \
     --pool_save_interval 10000 \
     --pool_eval_interval 0 \
     --prune_strategy oldest \
-    --total_timesteps 1000000 \
+    --total_timesteps 2000000 \
     --ent_coef 0.05 \
     --ent_coef_final 0.02 \
     --n_envs 16 \

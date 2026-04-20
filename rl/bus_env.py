@@ -126,6 +126,9 @@ class BusEnv(gym.Env):
         self._resolution_waste_round: Optional[int] = None
         self._resolution_waste_by_area: dict[str, dict[str, int]] = {}
         self._resolution_waste_total: int = 0
+        # Pending resolution-time Type 1 waste penalties, keyed by player_id.
+        # Populated by _maybe_record_resolution_waste(); consumed in step().
+        self._pending_resolution_waste_penalties: dict[int, float] = {}
 
         # Define spaces
         self.observation_space = spaces.Box(
@@ -165,6 +168,7 @@ class BusEnv(gym.Env):
         self._resolution_waste_round = None
         self._resolution_waste_by_area = {}
         self._resolution_waste_total = 0
+        self._pending_resolution_waste_penalties = {}
 
         # Episode bookkeeping
         self._step_count = 0
@@ -328,14 +332,18 @@ class BusEnv(gym.Env):
         truncated = self._step_count >= self._max_steps
         self._active_step_count += 1
 
-        # Compute reward
-        reward = self._reward_calculator.compute_reward(
+        # Compute reward (single call; inject pending resolution waste penalty)
+        reward_info = self._reward_calculator.compute_reward_detailed(
             state=self._engine.state,
             prev_state=prev_state,
             player_id=acting_player,
             done=terminated,
             action_info=action_info,
         )
+        reward_info.resolution_waste_penalty = self._pending_resolution_waste_penalties.pop(
+            acting_player, 0.0
+        )
+        reward = reward_info.total
 
         # Update previous state
         self._prev_state = self._engine.state.clone()
@@ -352,9 +360,7 @@ class BusEnv(gym.Env):
         info["head_id"] = info.get("action_head_id")
         info["head_name"] = info.get("action_head_name")
         info["acting_player"] = acting_player
-        info["reward_breakdown"] = self._reward_calculator.compute_reward_detailed(
-            self._engine.state, prev_state, acting_player, terminated, action_info
-        ).__dict__
+        info["reward_breakdown"] = reward_info.__dict__
 
         if terminated or truncated:
             self._episode_lengths.append(self._active_step_count)
@@ -481,6 +487,7 @@ class BusEnv(gym.Env):
         total_markers = 0
         wasted_markers = 0
 
+        waste_penalty = self._reward_config.resolution_type1_waste_penalty
         for slot in area_obj.slots.values():
             if slot.player_id is None:
                 continue
@@ -488,6 +495,11 @@ class BusEnv(gym.Env):
             slot_index = slot_index_map.get(slot.label, 0)
             if (max_buses - slot_index) <= 0:
                 wasted_markers += 1
+                # Accumulate resolution-time Type 1 waste penalty for the placing player
+                self._pending_resolution_waste_penalties[slot.player_id] = (
+                    self._pending_resolution_waste_penalties.get(slot.player_id, 0.0)
+                    + waste_penalty
+                )
 
         self._resolution_waste_by_area[area_key] = {
             "total": total_markers,
@@ -823,6 +835,10 @@ class BusEnv(gym.Env):
                 k: v.copy()
                 for k, v in self._reward_calculator._stations_connected.items()
             }
+            # Copy pending resolution waste penalties
+            new_env._pending_resolution_waste_penalties = dict(
+                self._pending_resolution_waste_penalties
+            )
 
         return new_env
 

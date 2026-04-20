@@ -64,9 +64,16 @@ class ObservationConfig:
     NODE_FEATURE_DIM: ClassVar[int] = 18
     EDGE_FEATURE_DIM: ClassVar[int] = 7
     PLAYER_FEATURE_DIM: ClassVar[int] = 10
-    SLOT_FEATURE_DIM: ClassVar[int] = 4
+    SLOT_FEATURE_DIM: ClassVar[int] = 4  # base; use slot_feature_dim property for actual dim
     PASSENGER_FEATURE_DIM: ClassVar[int] = 5
     GLOBAL_FEATURE_DIM: ClassVar[int] = 27 + 10 + 2  # base + head_id + vrroomm_stage
+
+    # Optional per-slot actionability feature (Proposal 4).
+    # When True, adds 1 binary is_actionable feature per slot (all 7 areas,
+    # padding 0 for non-M#oB areas). Increases obs dim by ACTION_AREAS *
+    # MAX_SLOTS_PER_AREA = 42.  Incompatible with checkpoints trained without
+    # this flag — use only at a fresh checkpoint boundary.
+    use_slot_actionability: bool = False
 
     @property
     def node_features_size(self) -> int:
@@ -84,9 +91,14 @@ class ObservationConfig:
         return self.MAX_PLAYERS * self.PLAYER_FEATURE_DIM
 
     @property
+    def slot_feature_dim(self) -> int:
+        """Effective slot feature dimension (4 base + 1 is_actionable if enabled)."""
+        return self.SLOT_FEATURE_DIM + (1 if self.use_slot_actionability else 0)
+
+    @property
     def action_board_size(self) -> int:
         """Total size of action board tensor."""
-        return self.ACTION_AREAS * self.MAX_SLOTS_PER_AREA * self.SLOT_FEATURE_DIM
+        return self.ACTION_AREAS * self.MAX_SLOTS_PER_AREA * self.slot_feature_dim
 
     @property
     def passenger_features_size(self) -> int:
@@ -289,8 +301,11 @@ class RewardConfig:
     invalid_action_penalty: float = -1.0
 
     # Marker placement shaping (early training signal)
-    marker_opportunity_bonus: float = 0.02
-    avoidable_waste_penalty: float = -0.02
+    marker_opportunity_bonus: float = 0.05
+    avoidable_waste_penalty: float = -0.1
+
+    # Resolution-time waste penalty (Type 1: slot index >= M#oB, fires at resolution)
+    resolution_type1_waste_penalty: float = -0.1
 
     # Resolve-phase shaping (tiny progression incentives)
     resolve_line_expansion_bonus: float = 0.005

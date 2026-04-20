@@ -504,7 +504,7 @@ class OpponentPool:
         """Iterate over checkpoints."""
         return iter(self.checkpoints)
 
-    def prime_from_pool(self, source_dir: str, n_top: int = 3, n_random: int = 2) -> int:
+    def prime_from_pool(self, source_dir: str, n_top: int = 15, n_random: int = 10) -> int:
         """Prime this pool by copying selected checkpoints from an existing pool.
 
         Selects the top-N checkpoints by Elo and a random sample from the
