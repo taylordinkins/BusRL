@@ -1826,6 +1826,49 @@ class TestActionResolver:
         # (BUSES is now auto-resolved)
         assert context.current_area == ActionAreaType.PASSENGERS
 
+    def test_start_resolution_skips_unplayable_vrroomm_slot_not_entire_area(
+        self, game_state: GameState
+    ):
+        """An unplayable first Vrroomm slot should not hide later playable slots."""
+        board = game_state.board
+        node_ids = list(board.nodes.keys())
+        edge_01 = make_edge_id(node_ids[0], node_ids[1])
+        edge_12 = make_edge_id(node_ids[1], node_ids[2])
+
+        if (
+            edge_01 not in board.edges
+            or edge_12 not in board.edges
+            or not board.get_node(node_ids[2]).building_slots
+        ):
+            pytest.skip("Board topology does not support this regression scenario")
+
+        # Give player 1 a simple 0-1-2 network while player 0 has no network.
+        board.edges[edge_01].add_rail(player_id=1)
+        board.edges[edge_12].add_rail(player_id=1)
+        game_state.players[1].place_rail()
+        game_state.players[1].place_rail()
+
+        # Time Clock auto-advances from HOUSE -> OFFICE before Vrroomm is reached.
+        board.get_node(node_ids[2]).building_slots[0].place_building(BuildingType.OFFICE)
+
+        passenger = game_state.passenger_manager.create_passenger(node_ids[0])
+        board.get_node(node_ids[0]).add_passenger(passenger.passenger_id)
+
+        # First marker (player 0) has no legal deliveries; second marker (player 1) does.
+        game_state.action_board.place_marker(ActionAreaType.VRROOMM, player_id=0)
+        game_state.action_board.place_marker(ActionAreaType.VRROOMM, player_id=1)
+
+        resolver = ActionResolver(game_state)
+        resolver.start_resolution()
+        context = resolver.get_context()
+
+        assert not resolver.is_complete()
+        assert context.current_area == ActionAreaType.VRROOMM
+        assert context.status == ResolutionStatus.AWAITING_INPUT
+        assert context.awaiting_player_id == 1
+        assert context.valid_actions
+        assert all(action["player_id"] == 1 for action in context.valid_actions)
+
     def test_is_complete_tracking(self, state_with_multiple_markers: GameState):
         """is_complete should track resolution progress."""
         resolver = ActionResolver(state_with_multiple_markers)

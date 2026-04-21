@@ -207,6 +207,8 @@ class ActionResolver:
                      # advance() -> _finalize_area() -> _advance_to_next_area_with_markers()
                      # To avoid recursion, we'll manually finalize the area and continue the loop.
                      self._resolve_area_automatically(area_type)
+                     if self._context.status == ResolutionStatus.AWAITING_INPUT:
+                         return
                      # After automatic resolution, we continue the loop to the next area
                      continue
                 else:
@@ -232,10 +234,15 @@ class ActionResolver:
             self._resolve_starting_player_internal()
         elif area_type == ActionAreaType.TIME_CLOCK:
             self._resolve_time_clock_auto_internal()
+        elif area_type == ActionAreaType.LINE_EXPANSION:
+            self._auto_skip_line_expansion_slots_internal()
+        elif area_type == ActionAreaType.PASSENGERS:
+            self._auto_skip_passengers_slots_internal()
+        elif area_type == ActionAreaType.BUILDINGS:
+            self._auto_skip_buildings_slots_internal()
+        elif area_type == ActionAreaType.VRROOMM:
+            self._auto_skip_vrroomm_slots_internal()
         else:
-            # For other areas (Expansion, Passengers, Buildings, Vrroomm!)
-            # If no input is needed, it means no markers were valid or something.
-            # We just finalize the area normally.
             self._finalize_area_internal(area_type)
 
     def _finalize_area_internal(self, area_type: ActionAreaType, result: Any = None) -> None:
@@ -276,6 +283,46 @@ class ActionResolver:
         self._finalize_area_internal(ActionAreaType.TIME_CLOCK, result)
         if result.game_ended:
             self._context.status = ResolutionStatus.ALL_COMPLETE
+
+    def _auto_skip_line_expansion_slots_internal(self) -> None:
+        while self._line_expansion_resolver and not self._line_expansion_resolver.is_resolution_complete():
+            self._line_expansion_resolver._finalize_current_slot()
+            if self._line_expansion_resolver.is_resolution_complete():
+                self._finalize_area_internal(ActionAreaType.LINE_EXPANSION)
+                return
+            self._check_for_player_input()
+            if self._context.status == ResolutionStatus.AWAITING_INPUT:
+                return
+
+    def _auto_skip_passengers_slots_internal(self) -> None:
+        while self._passengers_resolver and not self._passengers_resolver.is_resolution_complete():
+            self._passengers_resolver._current_slot_idx += 1
+            if self._passengers_resolver.is_resolution_complete():
+                self._finalize_area_internal(ActionAreaType.PASSENGERS)
+                return
+            self._check_for_player_input()
+            if self._context.status == ResolutionStatus.AWAITING_INPUT:
+                return
+
+    def _auto_skip_buildings_slots_internal(self) -> None:
+        while self._buildings_resolver and not self._buildings_resolver.is_resolution_complete():
+            self._buildings_resolver._current_slot_idx += 1
+            if self._buildings_resolver.is_resolution_complete():
+                self._finalize_area_internal(ActionAreaType.BUILDINGS)
+                return
+            self._check_for_player_input()
+            if self._context.status == ResolutionStatus.AWAITING_INPUT:
+                return
+
+    def _auto_skip_vrroomm_slots_internal(self) -> None:
+        while self._vrroomm_resolver and not self._vrroomm_resolver.is_resolution_complete():
+            self._vrroomm_resolver.finalize_current_slot()
+            if self._vrroomm_resolver.is_resolution_complete():
+                self._finalize_area_internal(ActionAreaType.VRROOMM)
+                return
+            self._check_for_player_input()
+            if self._context.status == ResolutionStatus.AWAITING_INPUT:
+                return
 
     def _setup_area_resolver(self, area_type: ActionAreaType) -> None:
         """Create the resolver for a specific area."""
