@@ -23,6 +23,44 @@ from gui.dialogs import (
     BuildingPlacementDialog, PassengerDistributionDialog,
     VrrooommDialog, TimeClockDialog, GameOverDialog
 )
+from gui.setup_config import GameSetupConfig, PlayerConfig
+
+# Milliseconds between AI deciding and executing (shows highlight).
+_AI_FLASH_MS = 500
+# Milliseconds between consecutive AI turns.
+_AI_BETWEEN_MS = 200
+
+
+def _describe_action(action: Any) -> str:
+    """Return a short human-readable description of an action for the log."""
+    from rl.policy_player import is_vrroomm_skip
+    if is_vrroomm_skip(action):
+        return "skipped VRROOMM deliveries"
+    if isinstance(action, Action):
+        t = action.action_type.value.replace("_", " ").lower()
+        p = action.params
+        if action.action_type == ActionType.PLACE_MARKER:
+            area = p.get("area_type", "")
+            return f"placed marker in {area}"
+        if action.action_type == ActionType.PASS:
+            return "passed"
+        if "edge_id" in p:
+            return f"{t} on edge {p['edge_id']}"
+        if "node_id" in p:
+            return f"{t} at node {p['node_id']}"
+        return t
+    if isinstance(action, dict):
+        if "edge_id" in action:
+            return f"rail on edge {action['edge_id']}"
+        if "to_node" in action:
+            return f"delivered passenger to node {action['to_node']}"
+        if "node_id" in action:
+            return f"building at node {action['node_id']}"
+        if "distribution" in action:
+            return "distributed passengers"
+        if "action" in action:
+            return str(action["action"])
+    return str(action)
 
 
 class InputMode(Enum):
@@ -74,6 +112,10 @@ class GameController(QObject):
         self._distribution_current: dict[int, int] = {}  # For PASSENGER_DISTRIBUTION
         self._vrroomm_selected_passenger: Optional[int] = None  # For VRROOMM_DELIVERY
 
+        # AI / player config
+        self._player_configs: dict[int, PlayerConfig] = {}
+        self._paused: bool = False
+
         # Connect window signals
         main_window.node_clicked.connect(self._on_node_clicked)
         main_window.edge_clicked.connect(self._on_edge_clicked)
@@ -81,19 +123,169 @@ class GameController(QObject):
         main_window.action_board_clicked.connect(self._on_action_board_clicked)
         main_window.pass_clicked.connect(self._on_pass_clicked)
         main_window.set_new_game_callback(self.start_new_game)
+        main_window.set_pause_callback(self._toggle_pause)
 
-    def start_new_game(self, num_players: int) -> None:
-        """Start a new game with the specified number of players."""
+    def start_new_game(self, config: GameSetupConfig) -> None:
+        """Start a new game using the provided setup configuration."""
+        from rl.policy_player import PolicyPlayer
+        from data.loader import load_default_board
+
+        num_players = config.num_players
         self._engine.reset(num_players=num_players)
         self._game_active = True
         self._action_resolver = None
         self._input_mode = InputMode.NONE
+        self._paused = False
+
+        # Build player config map and instantiate PolicyPlayers for AI slots.
+        self._player_configs = {}
+        board = self._engine.state.board
+        for pc in config.player_configs:
+            if not pc.is_human and pc.checkpoint_path and pc.policy_player is None:
+                try:
+                    pc.policy_player = PolicyPlayer.load(
+                        pc.checkpoint_path, num_players, board
+                    )
+                except Exception as exc:
+                    self._renderer.render_error(
+                        f"Failed to load model for Player {pc.player_id}: {exc}"
+                    )
+                    pc.is_human = True  # Fall back to human if load fails.
+            self._player_configs[pc.player_id] = pc
+
+        # Configure spectate mode (all AI) and AI badges.
+        spectate = config.is_spectate_mode
+        self._window.set_spectate_mode(spectate)
+        ai_ids = {pc.player_id for pc in config.player_configs if not pc.is_human}
+        self._window.set_ai_players(ai_ids)
 
         self._renderer.render_message(f"New game started with {num_players} players!")
         self._renderer.render_state(self._engine.state)
 
         self.game_started.emit()
         self._process_game_state()
+
+    # ------------------------------------------------------------------
+    # AI turn helpers
+    # ------------------------------------------------------------------
+
+    def _get_active_player_id(self) -> int:
+        """Return the player who must act right now.
+
+        During RESOLVING_ACTIONS the resolver's awaiting_player_id takes
+        precedence over the engine's current_player_idx.
+        """
+        if (
+            self._engine.state.phase == Phase.RESOLVING_ACTIONS
+            and self._action_resolver is not None
+        ):
+            ctx = self._action_resolver.get_context()
+            if ctx.awaiting_player_id is not None:
+                return ctx.awaiting_player_id
+        return self._engine.get_current_player().player_id
+
+    def _is_ai_turn(self) -> bool:
+        if not self._player_configs:
+            return False
+        pid = self._get_active_player_id()
+        pc = self._player_configs.get(pid)
+        return pc is not None and not pc.is_human
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self._window.update_pause_label(self._paused)
+        if not self._paused:
+            # Resume: re-enter the game loop.
+            QTimer.singleShot(0, self._process_game_state)
+
+    def _start_ai_turn(self) -> None:
+        """Compute the AI action, briefly highlight it, then execute it."""
+        pid = self._get_active_player_id()
+        pc = self._player_configs.get(pid)
+        if pc is None or pc.policy_player is None:
+            return
+
+        try:
+            action = pc.policy_player.get_action(self._engine, self._action_resolver)
+        except Exception as exc:
+            self._renderer.render_error(f"AI Player {pid} error: {exc}")
+            return
+
+        if action is None:
+            return
+
+        self._highlight_ai_action(action)
+        QTimer.singleShot(_AI_FLASH_MS, lambda: self._finalize_ai_turn(action, pid))
+
+    def _finalize_ai_turn(self, action: Any, pid: int) -> None:
+        """Execute the AI-chosen action and advance the game loop."""
+        from rl.policy_player import is_vrroomm_skip
+
+        self._window.clear_highlights()
+        state = self._engine.state
+
+        try:
+            if state.phase == Phase.RESOLVING_ACTIONS:
+                if is_vrroomm_skip(action):
+                    self._action_resolver.skip_vrroomm_deliveries()
+                else:
+                    self._action_resolver.apply_action(action)
+            else:
+                result = self._engine.step(action)
+                if not result.success:
+                    self._renderer.render_error(
+                        f"AI action failed: {result.info.get('error', 'unknown')}"
+                    )
+                    QTimer.singleShot(_AI_BETWEEN_MS, self._process_game_state)
+                    return
+        except Exception as exc:
+            self._renderer.render_error(f"AI Player {pid} action error: {exc}")
+            QTimer.singleShot(_AI_BETWEEN_MS, self._process_game_state)
+            return
+
+        self._renderer.render_message(f"Player {pid} (AI): {_describe_action(action)}")
+        self._renderer.render_state(self._engine.state)
+        QTimer.singleShot(_AI_BETWEEN_MS, self._process_game_state)
+
+    def _highlight_ai_action(self, action: Any) -> None:
+        """Briefly highlight what the AI chose before executing."""
+        from rl.policy_player import is_vrroomm_skip
+
+        if is_vrroomm_skip(action):
+            return
+
+        # Action object (setup / choosing phases)
+        if isinstance(action, Action):
+            if action.action_type == ActionType.PLACE_MARKER:
+                area = action.params.get("area_type")
+                if area:
+                    from core.constants import ActionAreaType as AAT
+                    self._window.highlight_valid_action_areas(
+                        [AAT(area)] if isinstance(area, str) else [area]
+                    )
+            elif action.action_type in (ActionType.PLACE_BUILDING_SETUP, ActionType.RESOLVE_BUILDINGS):
+                node_id = action.params.get("node_id")
+                slot_idx = action.params.get("slot_index")
+                if node_id is not None and slot_idx is not None:
+                    self._window.highlight_valid_slots({(node_id, slot_idx)})
+            elif action.action_type in (ActionType.PLACE_RAIL_SETUP,):
+                edge_id = action.params.get("edge_id")
+                if edge_id:
+                    self._window.highlight_valid_edges({tuple(edge_id)})
+            return
+
+        # Resolution action dict
+        if isinstance(action, dict):
+            if "edge_id" in action:
+                self._window.highlight_valid_edges({tuple(action["edge_id"])})
+            elif "node_id" in action and "slot_index" in action:
+                self._window.highlight_valid_slots(
+                    {(action["node_id"], action["slot_index"])}
+                )
+            elif "to_node" in action:
+                self._window.highlight_valid_nodes({action["to_node"]})
+
+    # ------------------------------------------------------------------
 
     def _process_game_state(self) -> None:
         """Process the current game state and prompt for action if needed."""
@@ -108,6 +300,17 @@ class GameController(QObject):
 
         # Get valid actions and update display
         self._valid_actions = self._engine.get_valid_actions()
+
+        # ---- AI turn check for non-resolution phases ----
+        # RESOLVING_ACTIONS is handled inside _handle_resolving_actions() after the
+        # resolver is fully initialized and advanced to AWAITING_INPUT.
+        if state.phase not in (Phase.CLEANUP, Phase.RESOLVING_ACTIONS) and self._is_ai_turn():
+            if self._paused:
+                QTimer.singleShot(100, self._process_game_state)
+            else:
+                self._start_ai_turn()
+            return
+        # --------------------------------------------------
 
         if state.phase == Phase.SETUP_BUILDINGS:
             self._handle_setup_buildings()
@@ -226,6 +429,16 @@ class GameController(QObject):
         context = self._action_resolver.get_context()
 
         if context.status == ResolutionStatus.AWAITING_INPUT:
+            # Check if the awaiting player is AI — if so, hand off immediately.
+            awaiting_pid = context.awaiting_player_id
+            if awaiting_pid is not None:
+                pc = self._player_configs.get(awaiting_pid)
+                if pc is not None and not pc.is_human:
+                    if self._paused:
+                        QTimer.singleShot(100, self._process_game_state)
+                    else:
+                        self._start_ai_turn()
+                    return
             self._handle_resolution_input(context)
         else:
             # Automatic resolution

@@ -96,7 +96,8 @@ class PlayerCardWidget(QFrame):
         self,
         player: Player,
         is_current: bool,
-        is_starting: bool
+        is_starting: bool,
+        is_ai: bool = False,
     ) -> None:
         """Update display from player state."""
         self._is_current = is_current
@@ -114,6 +115,8 @@ class PlayerCardWidget(QFrame):
             indicators.append("TURN")
         if is_starting:
             indicators.append("START")
+        if is_ai:
+            indicators.append("[AI]")
         self._current_indicator.setText(" ".join(indicators))
 
         # Status
@@ -156,6 +159,7 @@ class PlayerInfoWidget(QWidget):
 
         self._state: Optional[GameState] = None
         self._player_cards: list[PlayerCardWidget] = []
+        self._ai_player_ids: set[int] = set()
 
         self._layout = QHBoxLayout(self) # Back to horizontal
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -167,6 +171,10 @@ class PlayerInfoWidget(QWidget):
         self._layout.addLayout(self._cards_layout)
 
         self._layout.addStretch()
+
+    def set_ai_players(self, ai_player_ids: set[int]) -> None:
+        """Mark which player IDs are AI-controlled."""
+        self._ai_player_ids = set(ai_player_ids)
 
     def set_state(self, state: GameState) -> None:
         """Update the display from game state."""
@@ -192,5 +200,6 @@ class PlayerInfoWidget(QWidget):
             card.update_from_player(
                 player,
                 is_current=(i == current_idx),
-                is_starting=(i == starting_idx)
+                is_starting=(i == starting_idx),
+                is_ai=(i in self._ai_player_ids),
             )

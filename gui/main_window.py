@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Callable
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QFrame, QLabel, QStatusBar, QMenuBar, QMenu, QMessageBox,
     QDialog, QSpinBox, QPushButton, QDialogButtonBox, QFormLayout,
-    QTextEdit, QScrollArea
+    QTextEdit, QScrollArea, QRadioButton, QButtonGroup, QFileDialog,
+    QGridLayout, QGroupBox,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QAction, QCloseEvent
@@ -18,6 +20,7 @@ from core.constants import Phase
 
 from gui.widgets import BoardWidget, ActionBoardWidget, PlayerInfoWidget, GameInfoWidget
 from gui.constants import DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT
+from gui.setup_config import GameSetupConfig, PlayerConfig
 
 
 class MessageLogWidget(QFrame):
@@ -59,34 +62,175 @@ class MessageLogWidget(QFrame):
 
 
 class NewGameDialog(QDialog):
-    """Dialog for starting a new game."""
+    """Dialog for starting a new game with per-player Human / AI configuration."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
 
         self.setWindowTitle("New Game")
         self.setModal(True)
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(480)
 
-        layout = QFormLayout(self)
+        self._player_rows: list[dict] = []  # per-player widget refs
 
-        # Player count
+        outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+
+        # -- Player count --
+        count_row = QHBoxLayout()
+        count_row.addWidget(QLabel("Number of Players:"))
         self._player_spin = QSpinBox()
         self._player_spin.setMinimum(3)
         self._player_spin.setMaximum(5)
         self._player_spin.setValue(4)
-        layout.addRow("Number of Players:", self._player_spin)
+        count_row.addWidget(self._player_spin)
+        count_row.addStretch()
+        outer.addLayout(count_row)
 
-        # Buttons
-        buttons = QDialogButtonBox(
+        # -- Per-player configuration area --
+        self._players_box = QGroupBox("Player Configuration")
+        self._players_layout = QGridLayout(self._players_box)
+        self._players_layout.setColumnStretch(2, 1)
+        outer.addWidget(self._players_box)
+
+        # -- Buttons --
+        self._button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        self._button_box.button(QDialogButtonBox.StandardButton.Ok).setText("Start Game")
+        self._button_box.accepted.connect(self.accept)
+        self._button_box.rejected.connect(self.reject)
+        outer.addWidget(self._button_box)
+
+        # Build initial rows then connect spin so it rebuilds on change.
+        self._rebuild_player_rows(self._player_spin.value())
+        self._player_spin.valueChanged.connect(self._rebuild_player_rows)
+
+    # ------------------------------------------------------------------
+
+    def _rebuild_player_rows(self, num_players: int) -> None:
+        """Rebuild the per-player rows to match the chosen player count."""
+        # Remove old widgets from layout.
+        while self._players_layout.count():
+            item = self._players_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        self._player_rows.clear()
+
+        # Header labels.
+        self._players_layout.addWidget(QLabel("Player"), 0, 0)
+        self._players_layout.addWidget(QLabel("Type"), 0, 1)
+        self._players_layout.addWidget(QLabel("Model"), 0, 2)
+
+        for i in range(num_players):
+            row: dict = {}
+            grid_row = i + 1
+
+            # Player label.
+            lbl = QLabel(f"Player {i + 1}")
+            lbl.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            self._players_layout.addWidget(lbl, grid_row, 0)
+
+            # Human / AI toggle.
+            type_widget = QWidget()
+            type_layout = QHBoxLayout(type_widget)
+            type_layout.setContentsMargins(0, 0, 0, 0)
+            type_layout.setSpacing(6)
+
+            human_rb = QRadioButton("Human")
+            ai_rb = QRadioButton("AI")
+            # Player 0 defaults to Human; all others default to AI.
+            if i == 0:
+                human_rb.setChecked(True)
+            else:
+                ai_rb.setChecked(True)
+
+            btn_group = QButtonGroup(type_widget)
+            btn_group.addButton(human_rb, 0)
+            btn_group.addButton(ai_rb, 1)
+            type_layout.addWidget(human_rb)
+            type_layout.addWidget(ai_rb)
+            self._players_layout.addWidget(type_widget, grid_row, 1)
+
+            # Model row (load button + filename label).
+            model_widget = QWidget()
+            model_layout = QHBoxLayout(model_widget)
+            model_layout.setContentsMargins(0, 0, 0, 0)
+            model_layout.setSpacing(6)
+
+            load_btn = QPushButton("Load...")
+            load_btn.setFixedWidth(60)
+            path_lbl = QLabel("")
+            path_lbl.setFont(QFont("Consolas", 8))
+            path_lbl.setWordWrap(False)
+            model_layout.addWidget(load_btn)
+            model_layout.addWidget(path_lbl, stretch=1)
+            self._players_layout.addWidget(model_widget, grid_row, 2)
+
+            row = {
+                "human_rb": human_rb,
+                "ai_rb": ai_rb,
+                "btn_group": btn_group,
+                "load_btn": load_btn,
+                "path_lbl": path_lbl,
+                "checkpoint_path": None,
+                "model_widget": model_widget,
+            }
+            self._player_rows.append(row)
+
+            # Show/hide model picker based on current selection.
+            self._update_row_visibility(row)
+
+            # Connect signals (use default-arg capture for closure).
+            btn_group.buttonToggled.connect(
+                lambda _btn, _checked, r=row: self._on_type_toggled(r)
+            )
+            load_btn.clicked.connect(lambda _=False, r=row: self._on_load_model(r))
+
+        self._validate_ok_button()
+
+    def _update_row_visibility(self, row: dict) -> None:
+        row["model_widget"].setVisible(row["ai_rb"].isChecked())
+
+    def _on_type_toggled(self, row: dict) -> None:
+        self._update_row_visibility(row)
+        self._validate_ok_button()
+
+    def _on_load_model(self, row: dict) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load AI Model Checkpoint",
+            "",
+            "Model files (*.zip);;All files (*.*)",
+        )
+        if path:
+            row["checkpoint_path"] = path
+            row["path_lbl"].setText(os.path.basename(path))
+            self._validate_ok_button()
+
+    def _validate_ok_button(self) -> None:
+        ok = True
+        for row in self._player_rows:
+            if row["ai_rb"].isChecked() and not row["checkpoint_path"]:
+                ok = False
+                break
+        self._button_box.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ok)
+
+    # ------------------------------------------------------------------
+
+    def get_config(self) -> GameSetupConfig:
+        """Return the configured GameSetupConfig."""
+        configs = []
+        for i, row in enumerate(self._player_rows):
+            configs.append(PlayerConfig(
+                player_id=i,
+                is_human=row["human_rb"].isChecked(),
+                checkpoint_path=row["checkpoint_path"] if row["ai_rb"].isChecked() else None,
+            ))
+        return GameSetupConfig(player_configs=configs)
 
     def get_num_players(self) -> int:
-        """Get the selected number of players."""
+        """Convenience accessor kept for backwards compatibility."""
         return self._player_spin.value()
 
 
@@ -221,6 +365,17 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(splitter, stretch=1)
 
+        # Spectate controls (hidden unless all-AI game).
+        spectate_row = QHBoxLayout()
+        self._pause_btn = QPushButton("Pause")
+        self._pause_btn.setFixedWidth(90)
+        self._pause_btn.setVisible(False)
+        self._pause_callback: Optional[Callable[[], None]] = None
+        self._pause_btn.clicked.connect(self._on_pause_clicked)
+        spectate_row.addStretch()
+        spectate_row.addWidget(self._pause_btn)
+        main_layout.addLayout(spectate_row)
+
         # Bottom section: Message log
         self._message_log = MessageLogWidget()
         main_layout.addWidget(self._message_log)
@@ -298,17 +453,35 @@ class MainWindow(QMainWindow):
         """Handle new game menu action."""
         dialog = NewGameDialog(self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            num_players = dialog.get_num_players()
+            config = dialog.get_config()
             self._message_log.clear()
-            self.add_message(f"Starting new game with {num_players} players...")
-            # This will be connected to the game controller
-            # For now, emit a signal or call a callback
+            self.add_message(f"Starting new game with {config.num_players} players...")
             if hasattr(self, '_new_game_callback') and self._new_game_callback:
-                self._new_game_callback(num_players)
+                self._new_game_callback(config)
 
-    def set_new_game_callback(self, callback: Callable[[int], None]) -> None:
+    def set_new_game_callback(self, callback: Callable[["GameSetupConfig"], None]) -> None:
         """Set the callback for starting a new game."""
         self._new_game_callback = callback
+
+    def set_ai_players(self, ai_player_ids: set[int]) -> None:
+        """Mark which player IDs are AI-controlled (for badge display)."""
+        self._player_info.set_ai_players(ai_player_ids)
+
+    def set_spectate_mode(self, enabled: bool) -> None:
+        """Show or hide the Pause/Resume button for spectate (all-AI) mode."""
+        self._pause_btn.setVisible(enabled)
+
+    def set_pause_callback(self, callback: Callable[[], None]) -> None:
+        """Set the callback invoked when Pause/Resume is clicked."""
+        self._pause_callback = callback
+
+    def update_pause_label(self, paused: bool) -> None:
+        """Update Pause/Resume button text to reflect current state."""
+        self._pause_btn.setText("Resume" if paused else "Pause")
+
+    def _on_pause_clicked(self) -> None:
+        if hasattr(self, '_pause_callback') and self._pause_callback:
+            self._pause_callback()
 
     def _on_node_clicked(self, node_id: int) -> None:
         """Handle node click."""

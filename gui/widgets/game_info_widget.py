@@ -9,14 +9,15 @@ from PySide6.QtWidgets import (
     QGridLayout
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QColor, QPainter, QPen, QBrush
+from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtGui import QFont, QColor, QPainter, QPen, QBrush, QPolygonF
 
 from core.game_state import GameState
 from core.constants import (
     BuildingType, Phase, TOTAL_PASSENGERS, TOTAL_BUILDINGS_PER_TYPE
 )
 
-from gui.constants import TIME_CLOCK_COLORS, BUILDING_COLORS
+from gui.constants import TIME_CLOCK_COLORS, BUILDING_COLORS, BUILDING_BORDER_COLORS
 
 
 class TimeClockWidget(QFrame):
@@ -53,31 +54,40 @@ class TimeClockWidget(QFrame):
         positions = [BuildingType.HOUSE, BuildingType.OFFICE, BuildingType.PUB]
         names = ["House", "Office", "Pub"]
 
-        x_start = 20
+        x_start = 37
         y = 48
         spacing = 65
 
         for i, (building_type, name) in enumerate(zip(positions, names)):
-            x = x_start + i * spacing
-            color = BUILDING_COLORS[building_type]
+            cx = float(x_start + i * spacing)
+            fill_color = BUILDING_COLORS[building_type]
+            border_color = BUILDING_BORDER_COLORS[building_type]
 
             is_current = building_type == self._current_position
+            size = 26 if is_current else 18
+            half = size / 2
 
-            # Draw indicator circle
-            if is_current:
-                painter.setPen(QPen(QColor("#000000"), 3))
-                painter.setBrush(QBrush(color))
-                painter.drawEllipse(x, y - 15, 30, 30)
-            else:
-                painter.setPen(QPen(color.darker(120), 2))
-                painter.setBrush(QBrush(color.lighter(150)))
-                painter.drawEllipse(x + 5, y - 10, 20, 20)
+            border_width = 3 if is_current else 1.5
+            painter.setPen(QPen(border_color if not is_current else QColor("#000000"), border_width))
+            painter.setBrush(QBrush(fill_color if is_current else fill_color.lighter(140)))
+
+            if building_type == BuildingType.HOUSE:
+                painter.drawRect(QRectF(cx - half, y - half, size, size))
+            elif building_type == BuildingType.OFFICE:
+                points = QPolygonF([
+                    QPointF(cx, y - half),
+                    QPointF(cx - half, y + half),
+                    QPointF(cx + half, y + half),
+                ])
+                painter.drawPolygon(points)
+            elif building_type == BuildingType.PUB:
+                painter.drawEllipse(QPointF(cx, y), half, half)
 
             # Draw label
             painter.setFont(QFont("Arial", 8))
             painter.setPen(QColor("#333333"))
-            label_x = x + (15 if is_current else 15) - len(name) * 2
-            painter.drawText(label_x, y + 25, name)
+            label_x = int(cx) - len(name) * 2
+            painter.drawText(label_x, y + 26, name)
 
         # Draw time stones with more space
         painter.setFont(QFont("Arial", 10))
