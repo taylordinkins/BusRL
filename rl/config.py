@@ -290,32 +290,36 @@ class RewardConfig:
 
     # Delivery rewards
     delivery_reward: float = 1.0
-    stolen_passenger_bonus: float = 0.05
-    exclusive_delivery_bonus: float = 0.05
+    stolen_passenger_bonus: float = 0.15
+    exclusive_delivery_bonus: float = 0.08
 
     # Network building rewards
     station_connection_reward: float = 0.05
 
     # Penalties
-    time_stone_penalty: float = -0.05
+    time_stone_penalty: float = 0.0
     invalid_action_penalty: float = -1.0
 
     # Marker placement shaping (early training signal)
     marker_opportunity_bonus: float = 0.05
-    avoidable_waste_penalty: float = -0.1
+    avoidable_waste_penalty: float = -0.005
 
     # Resolution-time waste penalty (Type 1: slot index >= M#oB, fires at resolution)
-    resolution_type1_waste_penalty: float = -0.1
+    resolution_type1_waste_penalty: float = -0.03
 
     # Resolve-phase shaping (tiny progression incentives)
     resolve_line_expansion_bonus: float = 0.005
-    resolve_passengers_bonus: float = 0.001
+    resolve_passengers_bonus: float = 0.0005
     resolve_buildings_bonus: float = 0.001
+    vrroomm_placement_bonus: float = 0.005
+
+    # Starting player bonus (placement-time signal for taking starting player tile)
+    starting_player_bonus: float = 0.03
 
     # Terminal rewards use point differential (no config needed)
 
     # Add a "Won Game Reward"
-    won_game_bonus = 3.0
+    won_game_bonus = 5.0
     second_place_bonus = 1.0
     draw_bonus = 1.5
 

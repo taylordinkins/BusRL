@@ -191,8 +191,21 @@ class RewardCalculator:
             return 0.0, 0.0
 
         area = action_info.get("placed_marker_area")
+        if area is None:
+            return 0.0, 0.0
+
+        # Starting player tile: always a strategically useful placement
+        if area == "starting_player":
+            return float(self.config.starting_player_bonus), 0.0
+
+        # VRROOMM area: always signal positively at placement time
+        # (player only places here when deliveries are possible) - TODO: IS THIS TRUE?
+        if area == "vrroomm":
+            return float(self.config.vrroomm_placement_bonus), 0.0
+
+        # M#oB-scaled areas require slot index to determine actionability
         slot_label = action_info.get("placed_marker_slot")
-        if area is None or slot_label is None:
+        if slot_label is None:
             return 0.0, 0.0
 
         if area not in {"line_expansion", "passengers", "buildings"}:

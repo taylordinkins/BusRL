@@ -416,21 +416,21 @@
 python scripts/train.py \
     --use_opponent_pool \
     --multi_policy \
-    --self_play_prob 0.02 \
+    --self_play_prob 0.025 \
     --sampling_method pfsp \
     --pool_size 100 \
     --pool_save_interval 10000 \
     --pool_eval_interval 25000 \
     --pool_eval_opponents 10 \
     --pool_eval_games 10 \
-    --prune_strategy lowest_elo \
-    --total_timesteps 2000000 \
-    --ent_coef 0.001 \
-    --ent_coef_final 0.0005 \
+    --prune_strategy least_diverse \
+    --total_timesteps 6000000 \
+    --ent_coef 0.005 \
+    --ent_coef_final 0.001 \
     --n_envs 16 \
-    --n_steps 1024 \
-    --batch_size 2048 \
-    --target_kl 0.03 \
+    --n_steps 4096 \
+    --batch_size 4096 \
+    --target_kl 0.04 \
     --lr 7e-4 \
     --n_epochs 15 \
     --n_eval_episodes 10 \
@@ -442,10 +442,12 @@ python scripts/train.py \
     --skill_tracking openskill \
     --skill_temperature 30 \
     --pl_tau 30.0 \
-    --openskill_recenter_interval 2000000 \
-    --load_pool_dir logs/ppo_bus_20260419_220322/opponent_pool \
-    --initial_checkpoint logs/ppo_bus_20260419_220322/best_pool_model/best_model.zip \
+    --openskill_recenter_interval 6000000 \
     --start_fresh_directory \
     --prime_n_top 30 \
     --prime_n_random 10 \
+    --load_pool_dir logs/ppo_bus_20260430_161200/opponent_pool \
+    --initial_checkpoint logs/ppo_bus_20260430_161200/best_pool_model/best_model.zip \
     --use-slot-actionability
+
+    
