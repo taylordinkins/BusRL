@@ -33,8 +33,11 @@ from .opponent_pool import OpponentPool, CheckpointInfo, PoolConfig
 from .elo_tracker import EloTracker, MatchResult, HeadToHeadStats
 from .openskill_tracker import OpenSkillTracker
 from .multi_policy_env import MultiPolicyBusEnv, PolicySlot, MatchRunner
-from .mcts import MCTS, MCTSNode, MCTSConfig
-from .mcts_player import MCTSPlayer, PolicyPlayer, MCTSPlayerStats
+from .mcts import AlphaZeroMCTS, MCTSNode, MCTSConfig
+from .mcts_player import AlphaZeroPlayer, AlphaZeroPolicyPlayer
+from .alphazero_network import AlphaZeroNetwork, AlphaZeroNetworkConfig
+from .alphazero_self_play import SelfPlaySample, ReplayBuffer, SelfPlayWorker
+from .alphazero_trainer import AlphaZeroTrainer, AlphaZeroTrainingConfig
 from .vrroomm_stage import VrroommStageState
 from .policies import BusMaskableActorCriticPolicy
 from .callbacks import (
@@ -85,13 +88,19 @@ __all__ = [
     "HeadToHeadStats",
     # OpenSkill Rating System
     "OpenSkillTracker",
-    # MCTS
-    "MCTS",
+    # MCTS / AlphaZero
+    "AlphaZeroMCTS",
     "MCTSNode",
     "MCTSConfig",
-    "MCTSPlayer",
-    "PolicyPlayer",
-    "MCTSPlayerStats",
+    "AlphaZeroPlayer",
+    "AlphaZeroPolicyPlayer",
+    "AlphaZeroNetwork",
+    "AlphaZeroNetworkConfig",
+    "SelfPlaySample",
+    "ReplayBuffer",
+    "SelfPlayWorker",
+    "AlphaZeroTrainer",
+    "AlphaZeroTrainingConfig",
     "VrroommStageState",
     "BusMaskableActorCriticPolicy",
     # Callbacks

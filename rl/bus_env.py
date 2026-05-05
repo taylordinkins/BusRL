@@ -830,6 +830,7 @@ class BusEnv(gym.Env):
             new_env._engine = self._engine.clone()
             new_env._prev_state = self._prev_state.clone() if self._prev_state else None
             new_env._current_player_at_step = self._current_player_at_step
+            new_env._step_count = self._step_count
             # Copy reward calculator state
             new_env._reward_calculator._stations_connected = {
                 k: v.copy()
@@ -838,6 +839,11 @@ class BusEnv(gym.Env):
             # Copy pending resolution waste penalties
             new_env._pending_resolution_waste_penalties = dict(
                 self._pending_resolution_waste_penalties
+            )
+            # Copy vrroomm stage state (not part of engine state, must be copied explicitly)
+            new_env._vrroomm_stage_state = VrroommStageState(
+                stage=self._vrroomm_stage_state.stage,
+                selected_passenger_id=self._vrroomm_stage_state.selected_passenger_id,
             )
 
         return new_env
