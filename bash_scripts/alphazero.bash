@@ -38,7 +38,7 @@
 #
 # RESUMING A RUN:
 #   Pass --initial_checkpoint to the .pt file saved by the previous run.
-#   Example checkpoint path: logs/alphazero/checkpoint_0100.pt
+#   Preferred checkpoint path: logs/alphazero/incumbent.pt
 #   The trainer will also look for a matching _optim.pt sidecar to restore the
 #   Adam optimizer state. The replay buffer is NOT persisted across runs — it
 #   refills from self-play in the first few iterations.
@@ -95,7 +95,7 @@
 #   - min_buffer_size: 2500 -> 7500 (wait for ≈1.5 iters of data before training)
 #   - lr: 1e-3 -> 5e-4 (network is no longer random; reduce step size)
 #   - eval_games: 10 -> 20 (more games = lower variance rank estimate)
-#   - eval_rank_threshold: 0.52 -> 0.55 (tighter bar for promotion)
+#   - eval_rank_threshold: 0.52 -> 0.54 (moderate bar for promotion)
 #   - checkpoint_dir: new directory to keep runs isolated
 # python scripts/train_mcts.py \
 #     --iterations 200 \
@@ -114,11 +114,11 @@
 #     --dirichlet_epsilon 0.25 \
 #     --temperature_threshold 30 \
 #     --eval_games 20 \
-#     --eval_rank_threshold 0.55 \
+#     --eval_rank_threshold 0.54 \
 #     --eval_every 5 \
 #     --save_every 5 \
 #     --checkpoint_dir logs/alphazero_run2 \
-#     --initial_checkpoint logs/alphazero_run1/checkpoint_0100.pt \
+#     --initial_checkpoint logs/alphazero_run1/incumbent.pt \
 #     --device auto \
 #     --tensorboard
 
@@ -126,7 +126,7 @@
 # ── Run 3: Full strength ──────────────────────────────────────────────────────
 # Full AlphaZero regime. Resume from the best Run 2 checkpoint.
 # Changes vs. Run 2:
-#   - initial_checkpoint: best .pt from Run 2 (update path below)
+#   - initial_checkpoint: incumbent .pt from Run 2 (update path below)
 #   - n_simulations: 200 -> 400 (full AlphaZero quality; runtime ~2x longer/iter)
 #   - games_per_iter: 50 -> 100 (fill 200k replay buffer faster; also
 #                                 amortises the fixed MCTS overhead per iteration)
@@ -134,7 +134,7 @@
 #   - replay_buffer_size: 150000 -> 200000 (full capacity)
 #   - min_buffer_size: 15000 (≈ 1 iter of data at 100 games × ~150 moves/game)
 #   - lr: 5e-4 -> 2e-4 (network is maturing; reduce LR to preserve learned policy)
-#   - eval_rank_threshold: 0.55 -> 0.58 (raise bar as policy improves)
+#   - eval_rank_threshold: 0.54 -> 0.56 (raise bar as policy improves)
 #   - iterations: 300+ (run until eval/avg_rank plateaus for >50 consecutive iters)
 python scripts/train_mcts.py \
     --iterations 300 \
@@ -153,10 +153,10 @@ python scripts/train_mcts.py \
     --dirichlet_epsilon 0.25 \
     --temperature_threshold 30 \
     --eval_games 20 \
-    --eval_rank_threshold 0.58 \
+    --eval_rank_threshold 0.56 \
     --eval_every 5 \
     --save_every 5 \
     --checkpoint_dir logs/alphazero_run3 \
-    --initial_checkpoint logs/alphazero_run2/checkpoint_0200.pt \
+    --initial_checkpoint logs/alphazero_run2/incumbent.pt \
     --device auto \
     --tensorboard
