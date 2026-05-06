@@ -178,6 +178,7 @@ def run_self_play_parallel(
     n_workers: int = 1,
     use_reward_shaping: bool = False,
     verbose: bool = False,
+    progress_every: int = 1,
 ) -> list[SelfPlaySample]:
     """Run n_games self-play games, sequentially or in parallel.
 
@@ -190,13 +191,16 @@ def run_self_play_parallel(
                             >1 uses ThreadPoolExecutor (shares network weights).
         use_reward_shaping: Blend step rewards into z targets.
         verbose:            Print progress.
+        progress_every:     Print every N completed games when verbose=True.
 
     Returns:
         Flat list of SelfPlaySamples from all games.
     """
     all_samples: list[SelfPlaySample] = []
+    progress_every = max(int(progress_every), 1)
 
     if n_workers <= 1:
+        total_moves = 0
         for game_id in range(n_games):
             worker = SelfPlayWorker(
                 network, env_factory, mcts_config,
@@ -205,8 +209,14 @@ def run_self_play_parallel(
             )
             samples = worker.play_game()
             all_samples.extend(samples)
-            if verbose:
-                print(f"  Game {game_id + 1}/{n_games}: {len(samples)} moves")
+            total_moves += len(samples)
+            completed = game_id + 1
+            if verbose and (completed % progress_every == 0 or completed == n_games):
+                avg_moves = total_moves / max(completed, 1)
+                print(
+                    f"  Self-play progress: {completed}/{n_games} games, "
+                    f"last={len(samples)} moves, avg={avg_moves:.1f}"
+                )
     else:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -218,6 +228,8 @@ def run_self_play_parallel(
             )
             return worker.play_game()
 
+        completed = 0
+        total_moves = 0
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_run, gid): gid for gid in range(n_games)}
             for future in as_completed(futures):
@@ -225,8 +237,14 @@ def run_self_play_parallel(
                 try:
                     samples = future.result()
                     all_samples.extend(samples)
-                    if verbose:
-                        print(f"  Game {gid + 1}/{n_games}: {len(samples)} moves")
+                    completed += 1
+                    total_moves += len(samples)
+                    if verbose and (completed % progress_every == 0 or completed == n_games):
+                        avg_moves = total_moves / max(completed, 1)
+                        print(
+                            f"  Self-play progress: {completed}/{n_games} games, "
+                            f"last={len(samples)} moves, avg={avg_moves:.1f}"
+                        )
                 except Exception as exc:
                     print(f"  Game {gid} failed: {exc}")
 

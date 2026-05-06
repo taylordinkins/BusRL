@@ -62,6 +62,7 @@
 #     --iterations 100 \
 #     --games_per_iter 25 \
 #     --n_simulations 50 \
+#     --use_slot_actionability \
 #     --n_workers 1 \
 #     --trunk_layers 512 512 256 \
 #     --train_steps 500 \
@@ -101,6 +102,7 @@
 #     --iterations 200 \
 #     --games_per_iter 50 \
 #     --n_simulations 200 \
+#     --use_slot_actionability \
 #     --n_workers 1 \
 #     --trunk_layers 512 512 256 \
 #     --train_steps 1000 \
@@ -140,6 +142,7 @@ python scripts/train_mcts.py \
     --iterations 300 \
     --games_per_iter 100 \
     --n_simulations 400 \
+    --use_slot_actionability \
     --n_workers 1 \
     --trunk_layers 512 512 256 \
     --train_steps 1000 \

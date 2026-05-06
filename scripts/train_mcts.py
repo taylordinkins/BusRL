@@ -121,6 +121,8 @@ def main(args: argparse.Namespace) -> None:
         save_every_n_iterations=args.save_every,
         use_reward_shaping=args.use_reward_shaping,
         tensorboard=args.tensorboard,
+        self_play_verbose=True,
+        self_play_progress_every=args.self_play_progress_every,
     )
 
     env_factory = make_env_factory(args.num_players, obs_config)
@@ -202,6 +204,8 @@ if __name__ == "__main__":
                         help="Blend step rewards into terminal value targets")
     parser.add_argument("--tensorboard", action="store_true",
                         help="Enable TensorBoard logging")
+    parser.add_argument("--self_play_progress_every", type=int, default=5,
+                        help="When verbose, print every N completed self-play games")
 
     args = parser.parse_args()
     main(args)

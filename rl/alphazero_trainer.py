@@ -59,6 +59,8 @@ class AlphaZeroTrainingConfig:
 
     # TensorBoard
     tensorboard: bool = False
+    self_play_verbose: bool = False
+    self_play_progress_every: int = 5
 
 
 class AlphaZeroTrainer:
@@ -198,6 +200,8 @@ class AlphaZeroTrainer:
             n_games=self.config.games_per_iteration,
             n_workers=self.config.n_self_play_workers,
             use_reward_shaping=self.config.use_reward_shaping,
+            verbose=self.config.self_play_verbose,
+            progress_every=self.config.self_play_progress_every,
         )
         return samples
 
