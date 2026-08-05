@@ -745,3 +745,75 @@ class ActionResolver:
     def get_results(self) -> list[AreaResolutionResult]:
         """Get the results from all resolved areas."""
         return list(self._area_results)
+
+    def clone(self, new_state: "GameState") -> "ActionResolver":
+        """Create a fast copy of this resolver for MCTS simulation.
+
+        Only the currently active sub-resolver is cloned; completed and
+        not-yet-started ones are left as None.  The _area_results history
+        is discarded — it is not needed to continue a simulation.
+
+        Args:
+            new_state: The already-cloned GameState the new resolver should
+                       operate on.  All sub-resolver state references are
+                       remapped to this new state.
+
+        Returns:
+            A new ActionResolver ready to continue from the same point.
+        """
+        new_resolver = ActionResolver(new_state)
+
+        # Remap current_slot reference to the equivalent slot in the cloned
+        # action board (same area, same label).
+        new_slot = None
+        if self._context.current_slot is not None and self._context.current_area is not None:
+            new_area = new_state.action_board.get_area(self._context.current_area)
+            new_slot = new_area.slots.get(self._context.current_slot.label)
+
+        new_resolver._context = ResolutionContext(
+            current_area=self._context.current_area,
+            current_area_idx=self._context.current_area_idx,
+            current_slot=new_slot,
+            current_slot_idx=self._context.current_slot_idx,
+            status=self._context.status,
+            awaiting_player_id=self._context.awaiting_player_id,
+            valid_actions=list(self._context.valid_actions),
+        )
+
+        # Clone only the active sub-resolver.
+        active = self._context.current_area
+
+        if active == ActionAreaType.LINE_EXPANSION and self._line_expansion_resolver:
+            ler = LineExpansionResolver(new_state)
+            ler._current_slot_idx = self._line_expansion_resolver._current_slot_idx
+            ler._segments_placed_in_current_slot = (
+                self._line_expansion_resolver._segments_placed_in_current_slot
+            )
+            new_resolver._line_expansion_resolver = ler
+
+        elif active == ActionAreaType.PASSENGERS and self._passengers_resolver:
+            pr = PassengersResolver(new_state)
+            pr._current_slot_idx = self._passengers_resolver._current_slot_idx
+            new_resolver._passengers_resolver = pr
+
+        elif active == ActionAreaType.BUILDINGS and self._buildings_resolver:
+            br = BuildingsResolver(new_state)
+            br._current_slot_idx = self._buildings_resolver._current_slot_idx
+            br._buildings_placed_in_current_slot = (
+                self._buildings_resolver._buildings_placed_in_current_slot
+            )
+            new_resolver._buildings_resolver = br
+
+        elif active == ActionAreaType.VRROOMM and self._vrroomm_resolver:
+            # Create normally so __init__ calls _mark_existing_passengers_as_occupying(),
+            # which reconstructs _occupied_slots correctly from the cloned board state
+            # (delivered passengers are already at their destination nodes with
+            # occupied_by_passenger_id set on the cloned building slots).
+            vr = VrrooommResolver(new_state)
+            vr._current_slot_idx = self._vrroomm_resolver._current_slot_idx
+            vr._deliveries_in_current_slot = (
+                self._vrroomm_resolver._deliveries_in_current_slot
+            )
+            new_resolver._vrroomm_resolver = vr
+
+        return new_resolver

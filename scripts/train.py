@@ -33,7 +33,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 
 from rl.bus_env import BusEnv
-from rl.config import ObservationConfig
+from rl.config import ObservationConfig, RewardConfig, DEFAULT_REWARD_CONFIG
 from rl.wrappers import BusEnvSelfPlayWrapper
 from rl.opponent_pool import OpponentPool, PoolConfig
 from rl.elo_tracker import EloTracker
@@ -61,11 +61,47 @@ from rl.policies import BusMaskableActorCriticPolicy
 ##########
 
 
-def make_base_env(num_players: int, obs_config: ObservationConfig = None) -> BusEnv:
+def make_base_env(
+    num_players: int,
+    obs_config: ObservationConfig = None,
+    reward_config: RewardConfig = DEFAULT_REWARD_CONFIG,
+) -> BusEnv:
     """Create a base BusEnv instance."""
     if obs_config is not None:
-        return BusEnv(num_players=num_players, obs_config=obs_config)
-    return BusEnv(num_players=num_players)
+        return BusEnv(
+            num_players=num_players,
+            obs_config=obs_config,
+            reward_config=reward_config,
+        )
+    return BusEnv(num_players=num_players, reward_config=reward_config)
+
+
+def build_reward_config(args: argparse.Namespace) -> RewardConfig:
+    """Build reward config from CLI args."""
+    return RewardConfig(
+        delivery_reward=args.delivery_reward,
+        stolen_passenger_bonus=args.stolen_passenger_bonus,
+        exclusive_delivery_bonus=args.exclusive_delivery_bonus,
+        station_connection_reward=args.station_connection_reward,
+        time_stone_penalty=args.time_stone_penalty,
+        invalid_action_penalty=args.invalid_action_penalty,
+        marker_opportunity_bonus=args.marker_opportunity_bonus,
+        avoidable_waste_penalty=args.avoidable_waste_penalty,
+        resolution_type1_waste_penalty=args.resolution_type1_waste_penalty,
+        resolve_line_expansion_bonus=args.resolve_line_expansion_bonus,
+        resolve_passengers_bonus=args.resolve_passengers_bonus,
+        resolve_buildings_bonus=args.resolve_buildings_bonus,
+        vrroomm_placement_bonus=args.vrroomm_placement_bonus,
+        vrroomm_bonus_confirmed=args.vrroomm_bonus_confirmed,
+        vrroomm_bonus_probable=args.vrroomm_bonus_probable,
+        vrroomm_passenger_selection_bonus=args.vrroomm_passenger_selection_bonus,
+        starting_player_bonus=args.starting_player_bonus,
+        won_game_bonus=args.won_game_bonus,
+        second_place_bonus=args.second_place_bonus,
+        draw_bonus=args.draw_bonus,
+        use_score_based_terminal=args.use_score_based_terminal,
+        terminal_score_scale=args.terminal_score_scale,
+    )
 
 
 
@@ -123,21 +159,32 @@ def train(args):
         # Disable debug-only distribution validation to avoid Simplex drift
         torch.distributions.Distribution.set_default_validate_args(False)
 
-    # Build observation config (use_slot_actionability is opt-in to preserve
-    # checkpoint compatibility — see waste_management.md Proposal 4)
+    # Build observation config (optional features are opt-in to preserve
+    # checkpoint compatibility — see waste_management.md Proposal 4 and
+    # ppo_enhancements.md Priority 1)
     obs_config = ObservationConfig(
         use_slot_actionability=args.use_slot_actionability,
+        use_delivery_features=args.use_delivery_features,
     )
+    reward_config = build_reward_config(args)
+    feature_flags = []
     if args.use_slot_actionability:
-        print(f"Per-slot actionability feature ENABLED — obs dim: {obs_config.total_observation_dim}")
+        feature_flags.append("slot_actionability (+42)")
+    if args.use_delivery_features:
+        feature_flags.append("delivery_features (+33)")
+    if feature_flags:
+        print(f"Optional obs features ENABLED: {', '.join(feature_flags)} — obs dim: {obs_config.total_observation_dim}")
     else:
         print(f"Observation dim: {obs_config.total_observation_dim}")
+    print(f"Reward config: {reward_config}")
 
     # Create base log directory
     os.makedirs("logs", exist_ok=True)
     run_name = f"ppo_bus_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log_dir = os.path.join("logs", run_name)
     os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "reward_config.json"), "w") as f:
+        json.dump(reward_config.__dict__, f, indent=2, sort_keys=True)
 
     # Initialize opponent pool and Elo tracker if enabled
     opponent_pool = None
@@ -228,6 +275,7 @@ def train(args):
         # Capture these values for the closure (simple picklable values)
         _num_players = args.num_players
         _obs_config = obs_config
+        _reward_config = reward_config
         _multi_policy = args.multi_policy
         _self_play_prob = args.self_play_prob
         _sampling_method = args.sampling_method
@@ -246,7 +294,11 @@ def train(args):
                 import torch
                 torch.set_num_threads(1)
 
-            env = BusEnv(num_players=_num_players, obs_config=_obs_config)
+            env = BusEnv(
+                num_players=_num_players,
+                obs_config=_obs_config,
+                reward_config=_reward_config,
+            )
 
             # For training with multi-policy mode, wrap with MultiPolicyBusEnv
             if _multi_policy and _pool_dir is not None and not is_eval:
@@ -370,7 +422,7 @@ def train(args):
         log_path=log_dir,
         eval_freq=max(1, args.eval_freq // args.n_envs),
         n_eval_episodes=args.n_eval_episodes,
-        deterministic=True,
+        deterministic=args.eval_deterministic,
         render=False,
     )
     callbacks.append(eval_callback)
@@ -378,7 +430,7 @@ def train(args):
         eval_env=eval_env,
         eval_freq=max(1, args.eval_freq),
         n_eval_episodes=args.n_eval_episodes,
-        deterministic=True,
+        deterministic=args.eval_deterministic,
         debug_waste_log_path=args.waste_debug_log if args.waste_debug_log else None,
         verbose=0,
     )
@@ -426,7 +478,12 @@ def train(args):
 
         # Pool evaluation callback (actual head-to-head matches)
         if args.pool_eval_interval > 0:
-            env_factory = partial(make_base_env, args.num_players, obs_config)
+            env_factory = partial(
+                make_base_env,
+                args.num_players,
+                obs_config,
+                reward_config,
+            )
             pool_eval_callback = OpponentPoolEvalCallback(
                 opponent_pool=opponent_pool,
                 elo_tracker=elo_tracker,
@@ -468,6 +525,7 @@ def train(args):
         gae_lambda=args.gae_lambda,
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
         target_kl=args.target_kl,
         tensorboard_log="logs",
         device=args.device,
@@ -591,10 +649,70 @@ if __name__ == "__main__":
                         help="Add per-slot is_actionable feature to observation "
                              "(Proposal 4). Increases obs dim by 42. Incompatible "
                              "with checkpoints trained without this flag.")
+    parser.add_argument("--use-delivery-features", action="store_true",
+                        help="Add delivery-viability features to observation "
+                             "(ppo_enhancements.md Priority 1): 2 per-passenger "
+                             "flags (is_reachable, is_valid_source) + 3 global "
+                             "scalars. Increases obs dim by 33. Incompatible with "
+                             "checkpoints trained without this flag.")
+    parser.add_argument("--eval_deterministic", action="store_true",
+                        help="Use deterministic (greedy) policy during evaluation. "
+                             "Default is stochastic (samples from distribution) "
+                             "for genuine variance across eval episodes. "
+                             "(ppo_enhancements.md Priority 2)")
     parser.add_argument("--waste-debug-log", type=str, default=None,
                         help="If set, write per-slot resolution detail to this "
                              "path (JSON lines) during eval runs for waste metric "
                              "verification (Proposal 5).")
+    parser.add_argument("--delivery_reward", type=float, default=DEFAULT_REWARD_CONFIG.delivery_reward,
+                        help="Reward per passenger delivered")
+    parser.add_argument("--stolen_passenger_bonus", type=float, default=DEFAULT_REWARD_CONFIG.stolen_passenger_bonus,
+                        help="Bonus for delivering a passenger from an opponent-accessible source")
+    parser.add_argument("--exclusive_delivery_bonus", type=float, default=DEFAULT_REWARD_CONFIG.exclusive_delivery_bonus,
+                        help="Bonus for delivering to a destination not on an opponent network")
+    parser.add_argument("--station_connection_reward", type=float, default=DEFAULT_REWARD_CONFIG.station_connection_reward,
+                        help="Reward for first-time connection to a train station")
+    parser.add_argument("--time_stone_penalty", type=float, default=DEFAULT_REWARD_CONFIG.time_stone_penalty,
+                        help="Penalty per time stone taken")
+    parser.add_argument("--invalid_action_penalty", type=float, default=DEFAULT_REWARD_CONFIG.invalid_action_penalty,
+                        help="Penalty for invalid masked action attempts")
+    parser.add_argument("--marker_opportunity_bonus", type=float, default=DEFAULT_REWARD_CONFIG.marker_opportunity_bonus,
+                        help="Placement-time bonus for actionable markers")
+    parser.add_argument("--avoidable_waste_penalty", type=float, default=DEFAULT_REWARD_CONFIG.avoidable_waste_penalty,
+                        help="Placement-time penalty for markers that are guaranteed wasted")
+    parser.add_argument("--resolution_type1_waste_penalty", type=float, default=DEFAULT_REWARD_CONFIG.resolution_type1_waste_penalty,
+                        help="Resolution-time penalty for Type 1 wasted markers")
+    parser.add_argument("--resolve_line_expansion_bonus", type=float, default=DEFAULT_REWARD_CONFIG.resolve_line_expansion_bonus,
+                        help="Tiny shaping bonus on line expansion resolution actions")
+    parser.add_argument("--resolve_passengers_bonus", type=float, default=DEFAULT_REWARD_CONFIG.resolve_passengers_bonus,
+                        help="Tiny shaping bonus on passenger resolution actions")
+    parser.add_argument("--resolve_buildings_bonus", type=float, default=DEFAULT_REWARD_CONFIG.resolve_buildings_bonus,
+                        help="Tiny shaping bonus on building resolution actions")
+    parser.add_argument("--vrroomm_placement_bonus", type=float, default=DEFAULT_REWARD_CONFIG.vrroomm_placement_bonus,
+                        help="Legacy Vrroomm placement bonus field retained for config compatibility")
+    parser.add_argument("--vrroomm_bonus_confirmed", type=float, default=DEFAULT_REWARD_CONFIG.vrroomm_bonus_confirmed,
+                        help="Vrroomm placement bonus when delivery is confirmed for current or next clock")
+    parser.add_argument("--vrroomm_bonus_probable", type=float, default=DEFAULT_REWARD_CONFIG.vrroomm_bonus_probable,
+                        help="Vrroomm placement bonus when a delivery is probable but not confirmed")
+    parser.add_argument("--vrroomm_passenger_selection_bonus", type=float, default=DEFAULT_REWARD_CONFIG.vrroomm_passenger_selection_bonus,
+                        help="Bonus for selecting a Vrroomm passenger with at least one legal destination")
+    parser.add_argument("--starting_player_bonus", type=float, default=DEFAULT_REWARD_CONFIG.starting_player_bonus,
+                        help="Placement-time bonus for taking starting player")
+    parser.add_argument("--won_game_bonus", type=float, default=DEFAULT_REWARD_CONFIG.won_game_bonus,
+                        help="Terminal bonus for a unique first-place finish")
+    parser.add_argument("--second_place_bonus", type=float, default=DEFAULT_REWARD_CONFIG.second_place_bonus,
+                        help="Terminal bonus offset for finishing second")
+    parser.add_argument("--draw_bonus", type=float, default=DEFAULT_REWARD_CONFIG.draw_bonus,
+                        help="Terminal bonus for tying for first (ignored when --use_score_based_terminal)")
+    parser.add_argument("--use_score_based_terminal", action="store_true",
+                        help="Use absolute score as terminal reward instead of rank-differential. "
+                             "terminal = (player.score - time_stones) * terminal_score_scale. "
+                             "Decouples the terminal signal from opponent performance; "
+                             "won_game_bonus / draw_bonus / second_place_bonus are ignored.")
+    parser.add_argument("--terminal_score_scale", type=float, default=DEFAULT_REWARD_CONFIG.terminal_score_scale,
+                        help="Scale factor for score-based terminal reward (only used with "
+                             "--use_score_based_terminal). A value of 1.0 means 1 raw delivery "
+                             "point = 1.0 terminal reward unit.")
 
     # Training args
     parser.add_argument("--total_timesteps", type=int, default=1_000_000,
@@ -619,6 +737,10 @@ if __name__ == "__main__":
                         help="Final entropy coefficient (if less than initial, decay will occur)")
     parser.add_argument("--target_kl", type=float, default=0.03,
                         help="Target KL divergence")
+    parser.add_argument("--vf_coef", type=float, default=0.5,
+                        help="Value function coefficient in the PPO loss. SB3 default is 0.5. "
+                             "Increase toward 1.0 for sparse terminal-reward games to give the "
+                             "value function a stronger gradient signal.")
 
     # Logging and saving
     parser.add_argument("--save_freq", type=int, default=5_000,

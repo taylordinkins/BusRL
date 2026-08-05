@@ -293,9 +293,18 @@ class BusEnv(gym.Env):
                 )
                 if passenger_id not in valid_passenger_ids:
                     raise RuntimeError("Chosen passenger not in valid resolver actions")
-                self._select_vrroomm_passenger_with_tiebreak(
+                chosen_id = self._select_vrroomm_passenger_with_tiebreak(
                     int(passenger_id), valid_passenger_ids
                 )
+                # Shaping signal: did the chosen passenger have a valid destination?
+                # valid_actions lists all delivery actions (passenger_id, to_node, slot)
+                valid_actions = decision.get("valid_actions", [])
+                passenger_destinations = {
+                    (int(a["to_node"]), int(a["building_slot_index"]))
+                    for a in valid_actions
+                    if "passenger_id" in a and int(a["passenger_id"]) == chosen_id
+                }
+                action_info["vrroomm_passenger_has_destination"] = len(passenger_destinations) > 0
 
         elif head_id == HeadId.RESOLVE_VRROOMM_DEST:
             valid_destinations = decision["valid_destinations"]
@@ -828,6 +837,10 @@ class BusEnv(gym.Env):
 
         if self._engine is not None:
             new_env._engine = self._engine.clone()
+            # Clone resolver before touching any other fields so it can
+            # reference the already-cloned engine state.
+            if self._resolver is not None:
+                new_env._resolver = self._resolver.clone(new_env._engine.state)
             new_env._prev_state = self._prev_state.clone() if self._prev_state else None
             new_env._current_player_at_step = self._current_player_at_step
             new_env._step_count = self._step_count

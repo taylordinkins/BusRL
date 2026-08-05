@@ -1,5 +1,39 @@
 #!/bin/bash
 
+export LD_LIBRARY_PATH=/nfs/guille/tgd/wonglab/dinkinst/conda_install/envs/Bus/lib:${LD_LIBRARY_PATH}  
+
+# SMOKE TEST — matches Run 1 flags exactly; scaled way down for a fast end-to-end check.
+# min_buffer_size=1 so training is never skipped even with only 2 games of data.
+# eval_every=5 means evaluation is skipped for a single-iteration run.
+# python scripts/train_mcts.py \
+#     --iterations 1 \
+#     --games_per_iter 2 \
+#     --n_simulations 5 \
+#     --use_slot_actionability \
+#     --n_workers 1 \
+#     --trunk_layers 512 512 256 \
+#     --train_steps 5 \
+#     --batch_size 64 \
+#     --replay_buffer_size 50000 \
+#     --min_buffer_size 1 \
+#     --lr 1e-3 \
+#     --max_grad_norm 1.0 \
+#     --c_puct 1.5 \
+#     --dirichlet_alpha 0.3 \
+#     --dirichlet_epsilon 0.25 \
+#     --temperature_threshold 30 \
+#     --eval_games 2 \
+#     --eval_rank_threshold 0.52 \
+#     --eval_every 5 \
+#     --save_every 1 \
+#     --checkpoint_dir logs/alphazero_smoke \
+#     --device auto \
+#     --use_reward_shaping \
+#     --tensorboard
+
+# Original minimal smoke test (missing --use_slot_actionability and other Run 1 flags):
+# python scripts/train_mcts.py --iterations 2 --games_per_iter 2 --n_simulations 20 --n_workers 1
+
 # ============================================================================
 # AlphaZero training for Bus — principled run sequence
 # ============================================================================
@@ -58,30 +92,34 @@
 # immediately after the first self-play batch.
 # save_every=5 / eval_every=5 means you get a checkpoint every ~5 iters and
 # a rank comparison every 5 iters once a previous checkpoint exists (iter 6+).
-# python scripts/train_mcts.py \
-#     --iterations 100 \
-#     --games_per_iter 25 \
-#     --n_simulations 50 \
-#     --use_slot_actionability \
-#     --n_workers 1 \
-#     --trunk_layers 512 512 256 \
-#     --train_steps 500 \
-#     --batch_size 512 \
-#     --replay_buffer_size 50000 \
-#     --min_buffer_size 2500 \
-#     --lr 1e-3 \
-#     --max_grad_norm 1.0 \
-#     --c_puct 1.5 \
-#     --dirichlet_alpha 0.3 \
-#     --dirichlet_epsilon 0.25 \
-#     --temperature_threshold 30 \
-#     --eval_games 10 \
-#     --eval_rank_threshold 0.52 \
-#     --eval_every 5 \
-#     --save_every 5 \
-#     --checkpoint_dir logs/alphazero_run1 \
-#     --device auto \
-#     --tensorboard
+python scripts/train_mcts.py \
+    --iterations 100 \
+    --games_per_iter 10 \
+    --n_simulations 50 \
+    --use_slot_actionability \
+    --use_per_phase_heads \
+    --n_workers 1 \
+    --trunk_layers 256 256 128 \
+    --train_steps 500 \
+    --batch_size 512 \
+    --replay_buffer_size 50000 \
+    --min_buffer_size 2500 \
+    --lr 1e-3 \
+    --max_grad_norm 2.0 \
+    --c_puct 1.8 \
+    --dirichlet_alpha 0.3 \
+    --dirichlet_epsilon 0.25 \
+    --temperature_threshold 30 \
+    --eval_games 40 \
+    --eval_rank_threshold 0.51 \
+    --eval_every 5 \
+    --save_every 5 \
+    --checkpoint_dir logs/alphazero_run1 \
+    --device auto \
+    --rollout_to_round_end \
+    --rollout_reward_weight 0.4 \
+    --use_reward_shaping \
+    --tensorboard
 
 
 # ── Run 2: Ramp-up ───────────────────────────────────────────────────────────
@@ -138,28 +176,28 @@
 #   - lr: 5e-4 -> 2e-4 (network is maturing; reduce LR to preserve learned policy)
 #   - eval_rank_threshold: 0.54 -> 0.56 (raise bar as policy improves)
 #   - iterations: 300+ (run until eval/avg_rank plateaus for >50 consecutive iters)
-python scripts/train_mcts.py \
-    --iterations 300 \
-    --games_per_iter 100 \
-    --n_simulations 400 \
-    --use_slot_actionability \
-    --n_workers 1 \
-    --trunk_layers 512 512 256 \
-    --train_steps 1000 \
-    --batch_size 512 \
-    --replay_buffer_size 200000 \
-    --min_buffer_size 15000 \
-    --lr 2e-4 \
-    --max_grad_norm 1.0 \
-    --c_puct 1.5 \
-    --dirichlet_alpha 0.3 \
-    --dirichlet_epsilon 0.25 \
-    --temperature_threshold 30 \
-    --eval_games 20 \
-    --eval_rank_threshold 0.56 \
-    --eval_every 5 \
-    --save_every 5 \
-    --checkpoint_dir logs/alphazero_run3 \
-    --initial_checkpoint logs/alphazero_run2/incumbent.pt \
-    --device auto \
-    --tensorboard
+# python scripts/train_mcts.py \
+#     --iterations 300 \
+#     --games_per_iter 100 \
+#     --n_simulations 400 \
+#     --use_slot_actionability \
+#     --n_workers 1 \
+#     --trunk_layers 512 512 256 \
+#     --train_steps 1000 \
+#     --batch_size 512 \
+#     --replay_buffer_size 200000 \
+#     --min_buffer_size 15000 \
+#     --lr 2e-4 \
+#     --max_grad_norm 1.0 \
+#     --c_puct 1.5 \
+#     --dirichlet_alpha 0.3 \
+#     --dirichlet_epsilon 0.25 \
+#     --temperature_threshold 30 \
+#     --eval_games 20 \
+#     --eval_rank_threshold 0.56 \
+#     --eval_every 5 \
+#     --save_every 5 \
+#     --checkpoint_dir logs/alphazero_run3 \
+#     --initial_checkpoint logs/alphazero_run2/incumbent.pt \
+#     --device auto \
+#     --tensorboard

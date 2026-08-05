@@ -12,8 +12,8 @@ existing MaskablePPO pipeline (train.py / logs/ppo_*).
 from __future__ import annotations
 
 import copy
+import datetime
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +57,13 @@ class AlphaZeroTrainingConfig:
     # Reward
     use_reward_shaping: bool = False   # False = terminal outcome only (AlphaZero default)
 
+    # KL regularization from BC checkpoint (3.2)
+    kl_weight_initial: float = 0.0    # starting KL weight; 0.0 = disabled
+    kl_total_iters: int = 100         # iterations over which kl_weight decays linearly to 0
+
+    # Mid-game curriculum (5.1)
+    bc_rounds: int = 0                # play this many rounds with BC policy before MCTS takes over
+
     # TensorBoard
     tensorboard: bool = False
     self_play_verbose: bool = False
@@ -73,6 +80,7 @@ class AlphaZeroTrainer:
         env_factory: Callable,  # () -> BusEnv
         mcts_config,          # MCTSConfig
         device: Optional[torch.device] = None,
+        bc_checkpoint_path: Optional[str] = None,
     ):
         self.network = network
         self.config = training_config
@@ -92,14 +100,29 @@ class AlphaZeroTrainer:
         self.replay_buffer = ReplayBuffer(max_size=training_config.replay_buffer_size)
 
         self._iteration = 0
+        self._optimizer_step_count = 0
         self._checkpoint_dir = Path(training_config.checkpoint_dir)
         self._checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # BC network for KL regularization (3.2) and mid-game curriculum (5.1)
+        self._bc_network = None
+        if bc_checkpoint_path is not None:
+            from .alphazero_network import AlphaZeroNetwork
+            self._bc_network = AlphaZeroNetwork.load(bc_checkpoint_path)
+            self._bc_network.to(self.device)
+            self._bc_network.eval()
+            print(f"Loaded BC network for KL reg / curriculum: {bc_checkpoint_path}")
+
+        # Each run gets its own timestamped TensorBoard subdirectory so
+        # restarts don't produce overlapping sawtooth curves (2.1)
         self._writer = None
         if training_config.tensorboard:
             try:
                 from torch.utils.tensorboard import SummaryWriter
-                self._writer = SummaryWriter(log_dir=str(self._checkpoint_dir / "tb"))
+                run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                self._writer = SummaryWriter(
+                    log_dir=str(self._checkpoint_dir / "tb" / run_tag)
+                )
             except ImportError:
                 print("TensorBoard not available; continuing without it.")
 
@@ -109,7 +132,9 @@ class AlphaZeroTrainer:
 
     def train(self, n_iterations: int) -> None:
         """Run n_iterations of self-play → train → (eval) cycles."""
-        print(f"AlphaZero training: {n_iterations} iterations")
+        start_iteration = self._iteration + 1
+        end_iteration = self._iteration + n_iterations
+        print(f"AlphaZero training: iterations {start_iteration}..{end_iteration}")
         print(f"  Checkpoint dir: {self._checkpoint_dir}")
         print(f"  Device: {self.device}")
         if self._prev_checkpoint_path is None:
@@ -119,14 +144,21 @@ class AlphaZeroTrainer:
 
         # LR scheduler covers the full training run
         if self.config.lr_schedule == "cosine":
+            for group in self.optimizer.param_groups:
+                group.setdefault("initial_lr", self.config.learning_rate)
             scheduler = CosineAnnealingLR(
                 self.optimizer,
-                T_max=n_iterations * self.config.train_steps_per_iteration,
+                T_max=max(
+                    self._optimizer_step_count
+                    + n_iterations * self.config.train_steps_per_iteration,
+                    1,
+                ),
+                last_epoch=self._optimizer_step_count - 1,
             )
         else:
             scheduler = None
 
-        for it in range(1, n_iterations + 1):
+        for it in range(start_iteration, end_iteration + 1):
             self._iteration = it
             t0 = time.time()
 
@@ -134,6 +166,13 @@ class AlphaZeroTrainer:
             print(f"\n[Iter {it}] Self-play ({self.config.games_per_iteration} games)...")
             samples = self._self_play_phase()
             self.replay_buffer.add_game(samples)
+            if samples:
+                z_arr = np.stack([s.value_target for s in samples])
+                print(
+                    f"  Value targets (z): mean={z_arr.mean():.4f}  std={z_arr.std():.4f}"
+                    f"  min={z_arr.min():.4f}  max={z_arr.max():.4f}"
+                    f"  unique_vals={len(np.unique(z_arr.round(3)))}"
+                )
             print(f"  Buffer size: {len(self.replay_buffer)}")
 
             if len(self.replay_buffer) < self.config.min_buffer_size:
@@ -145,8 +184,14 @@ class AlphaZeroTrainer:
             loss_info = self._training_phase(scheduler)
             print(
                 f"  policy_loss={loss_info['policy_loss']:.4f}  "
-                f"value_loss={loss_info['value_loss']:.4f}  "
-                f"total={loss_info['total_loss']:.4f}"
+                f"value_loss={loss_info['value_loss']:.6f}  "
+                f"total={loss_info['total_loss']:.4f}  "
+                f"grad_norm={loss_info['grad_norm']:.4f}  "
+                f"lr={loss_info['lr']:.2e}"
+            )
+            print(
+                f"  z (target):  mean={loss_info['z_mean']:.4f}  std={loss_info['z_std']:.4f}"
+                f"  |  v (pred):  mean={loss_info['v_mean']:.4f}  std={loss_info['v_std']:.4f}"
             )
 
             if self._writer is not None:
@@ -154,6 +199,13 @@ class AlphaZeroTrainer:
                 self._writer.add_scalar("train/policy_loss", loss_info["policy_loss"], global_step)
                 self._writer.add_scalar("train/value_loss", loss_info["value_loss"], global_step)
                 self._writer.add_scalar("train/total_loss", loss_info["total_loss"], global_step)
+                self._writer.add_scalar("train/grad_norm", loss_info["grad_norm"], global_step)
+                self._writer.add_scalar("train/lr", loss_info["lr"], global_step)
+                if not (loss_info["z_mean"] != loss_info["z_mean"]):  # not NaN
+                    self._writer.add_scalar("train/z_mean", loss_info["z_mean"], global_step)
+                    self._writer.add_scalar("train/z_std", loss_info["z_std"], global_step)
+                    self._writer.add_scalar("train/v_mean", loss_info["v_mean"], global_step)
+                    self._writer.add_scalar("train/v_std", loss_info["v_std"], global_step)
 
             # ── Evaluation ───────────────────────────────────────────────────
             if it % self.config.eval_every_n_iterations == 0 and self._prev_checkpoint_path:
@@ -202,6 +254,8 @@ class AlphaZeroTrainer:
             use_reward_shaping=self.config.use_reward_shaping,
             verbose=self.config.self_play_verbose,
             progress_every=self.config.self_play_progress_every,
+            bc_network=self._bc_network,
+            bc_rounds=self.config.bc_rounds,
         )
         return samples
 
@@ -209,13 +263,22 @@ class AlphaZeroTrainer:
         """Gradient updates on replay buffer; returns average losses."""
         self.network.train()
         policy_losses, value_losses, total_losses = [], [], []
+        grad_norms = []
+        z_means, z_stds, v_means, v_stds = [], [], [], []
+
+        # Linear decay of KL weight from initial → 0 over kl_total_iters
+        if self.config.kl_weight_initial > 0 and self.config.kl_total_iters > 0:
+            decay = max(0.0, 1.0 - self._iteration / self.config.kl_total_iters)
+            kl_weight = self.config.kl_weight_initial * decay
+        else:
+            kl_weight = 0.0
 
         for _ in range(self.config.train_steps_per_iteration):
             batch = self.replay_buffer.sample_batch(self.config.batch_size)
             if not batch:
                 break
 
-            p_loss, v_loss = self._compute_loss(batch)
+            p_loss, v_loss, diag = self._compute_loss(batch, kl_weight=kl_weight)
             total = (
                 self.config.policy_loss_weight * p_loss
                 + self.config.value_loss_weight * v_loss
@@ -223,21 +286,34 @@ class AlphaZeroTrainer:
 
             self.optimizer.zero_grad()
             total.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.network.parameters(), self.config.max_grad_norm
             )
             self.optimizer.step()
+            self._optimizer_step_count += 1
             if scheduler is not None:
                 scheduler.step()
 
             policy_losses.append(p_loss.item())
             value_losses.append(v_loss.item())
             total_losses.append(total.item())
+            grad_norms.append(float(grad_norm))
+            if diag:
+                z_means.append(diag["z_mean"])
+                z_stds.append(diag["z_std"])
+                v_means.append(diag["v_mean"])
+                v_stds.append(diag["v_std"])
 
         return {
             "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
             "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
             "total_loss": float(np.mean(total_losses)) if total_losses else 0.0,
+            "grad_norm": float(np.mean(grad_norms)) if grad_norms else 0.0,
+            "lr": self.optimizer.param_groups[0]["lr"],
+            "z_mean": float(np.mean(z_means)) if z_means else float("nan"),
+            "z_std": float(np.mean(z_stds)) if z_stds else float("nan"),
+            "v_mean": float(np.mean(v_means)) if v_means else float("nan"),
+            "v_std": float(np.mean(v_stds)) if v_stds else float("nan"),
         }
 
     def _evaluation_phase(self) -> float:
@@ -249,6 +325,7 @@ class AlphaZeroTrainer:
         """
         from .mcts import AlphaZeroMCTS, MCTSConfig
         from .alphazero_network import AlphaZeroNetwork
+        from .alphazero_self_play import normalized_rank_for_player
 
         if self._prev_checkpoint_path is None:
             return 0.0
@@ -262,8 +339,14 @@ class AlphaZeroTrainer:
             n_simulations=self.mcts_config.n_simulations,
             c_puct=self.mcts_config.c_puct,
             temperature=0.0,
+            temperature_threshold=self.mcts_config.temperature_threshold,
+            dirichlet_alpha=self.mcts_config.dirichlet_alpha,
             dirichlet_epsilon=0.0,
             num_players=self.mcts_config.num_players,
+            rollout_steps=self.mcts_config.rollout_steps,
+            rollout_reward_weight=self.mcts_config.rollout_reward_weight,
+            rollout_reward_scale=self.mcts_config.rollout_reward_scale,
+            rollout_to_round_end=self.mcts_config.rollout_to_round_end,
         )
         new_mcts = AlphaZeroMCTS(self.network, eval_mcts_cfg)
         old_mcts = AlphaZeroMCTS(old_net, eval_mcts_cfg)
@@ -288,49 +371,28 @@ class AlphaZeroTrainer:
                     break
 
             if env._engine is not None:
-                rank_sum += self._normalized_rank(
-                    env, player_id=new_model_slot
-                )
+                rank_sum += normalized_rank_for_player(env, player_id=new_model_slot)
 
         return rank_sum / max(self.config.eval_games, 1)
 
-    @staticmethod
-    def _normalized_rank(env, player_id: int) -> float:
-        """Compute z = (n - rank) / (n - 1) using average rank for ties.
-
-        Matches the formula used in AlphaZeroMCTS._get_terminal_values().
-        """
-        state = env._engine.state
-        scores = {p.player_id: p.score for p in state.players}
-        n = len(scores)
-        sorted_items = sorted(scores.items(), key=lambda x: -x[1])
-
-        i = 0
-        while i < n:
-            j = i
-            while j < n and sorted_items[j][1] == sorted_items[i][1]:
-                j += 1
-            avg_rank = (i + 1 + j) / 2
-            for k in range(i, j):
-                if sorted_items[k][0] == player_id:
-                    return (n - avg_rank) / max(n - 1, 1)
-            i = j
-
-        return 0.0
-
     # ── Loss computation ──────────────────────────────────────────────────────
 
-    def _compute_loss(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+    def _compute_loss(
+        self, batch, kl_weight: float = 0.0
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Compute policy cross-entropy and value MSE for one batch.
 
-        Policy loss: -mean(sum(π_mcts * log_softmax(logits)))
+        Policy loss: -mean(sum(π_mcts * log_softmax(logits))) + kl_weight * KL(BC||current)
         Value loss:  mean(||v_θ - z||²)
+
+        Returns (policy_loss, value_loss, diag) where diag contains z/v stats
+        for debugging (empty dict in per-phase mode).
 
         In per-phase mode we group samples by head_id and process each
         group separately (different head sizes require separate forward calls).
         """
         if self.network.config.use_per_phase_heads:
-            return self._compute_loss_per_phase(batch)
+            return self._compute_loss_per_phase(batch, kl_weight=kl_weight)
 
         # ── Flat mode ─────────────────────────────────────────────────────────
         obs_t = torch.as_tensor(
@@ -347,11 +409,29 @@ class AlphaZeroTrainer:
 
         log_probs = F.log_softmax(logits, dim=1)
         policy_loss = -torch.mean(torch.sum(pi_t * log_probs, dim=1))
+
+        if self._bc_network is not None and kl_weight > 0:
+            with torch.no_grad():
+                bc_logits, _ = self._bc_network(obs_t)
+                bc_log_probs = F.log_softmax(bc_logits, dim=1)
+            kl_loss = F.kl_div(log_probs, bc_log_probs.exp(), reduction="batchmean")
+            policy_loss = policy_loss + kl_weight * kl_loss
+
         value_loss = F.mse_loss(value, z_t)
 
-        return policy_loss, value_loss
+        with torch.no_grad():
+            diag = {
+                "z_mean": z_t.mean().item(),
+                "z_std": z_t.std().item(),
+                "v_mean": value.mean().item(),
+                "v_std": value.std().item(),
+            }
 
-    def _compute_loss_per_phase(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        return policy_loss, value_loss, diag
+
+    def _compute_loss_per_phase(
+        self, batch, kl_weight: float = 0.0
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """Loss for per-phase head mode: process each head_id group separately."""
         from collections import defaultdict
 
@@ -362,6 +442,8 @@ class AlphaZeroTrainer:
         policy_loss = torch.tensor(0.0, device=self.device)
         value_loss = torch.tensor(0.0, device=self.device)
         n_total = 0
+        all_z_list: list[torch.Tensor] = []
+        all_v_list: list[torch.Tensor] = []
 
         for head_id, group in groups.items():
             if head_id < 0:
@@ -383,15 +465,37 @@ class AlphaZeroTrainer:
             logits, value = self.network(obs_t, head_id=head_id)
             log_probs = F.log_softmax(logits, dim=1)
             policy_loss = policy_loss + torch.sum(-torch.sum(pi_t * log_probs, dim=1))
+
+            if self._bc_network is not None and kl_weight > 0:
+                with torch.no_grad():
+                    bc_logits, _ = self._bc_network(obs_t, head_id=head_id)
+                    bc_log_probs = F.log_softmax(bc_logits, dim=1)
+                # KL(BC || current): penalizes moving away from BC prior
+                # Use reduction="sum" so we can normalize consistently with policy_loss
+                kl_loss = F.kl_div(log_probs, bc_log_probs.exp(), reduction="sum")
+                policy_loss = policy_loss + kl_weight * kl_loss
+
             value_loss = value_loss + torch.sum((value - z_t) ** 2)
             n_total += len(group)
+            all_z_list.append(z_t.detach())
+            all_v_list.append(value.detach())
 
         if n_total == 0:
-            return policy_loss, value_loss
+            return policy_loss, value_loss, {}
 
         policy_loss = policy_loss / n_total
         value_loss = value_loss / n_total
-        return policy_loss, value_loss
+
+        with torch.no_grad():
+            all_z = torch.cat(all_z_list, dim=0)
+            all_v = torch.cat(all_v_list, dim=0)
+            diag = {
+                "z_mean": all_z.mean().item(),
+                "z_std": all_z.std().item() if all_z.numel() > 1 else 0.0,
+                "v_mean": all_v.mean().item(),
+                "v_std": all_v.std().item() if all_v.numel() > 1 else 0.0,
+            }
+        return policy_loss, value_loss, diag
 
     # ── Checkpoint I/O ────────────────────────────────────────────────────────
 
@@ -405,13 +509,17 @@ class AlphaZeroTrainer:
         stem = name if name else f"checkpoint_{iteration:04d}"
         pt_path = self._checkpoint_dir / f"{stem}.pt"
         meta_path = self._checkpoint_dir / f"{stem}_meta.json"
+        replay_path = self._checkpoint_dir / f"{stem}_replay.pkl"
 
         self.network.save(pt_path)
         torch.save(self.optimizer.state_dict(), self._checkpoint_dir / f"{stem}_optim.pt")
+        self.replay_buffer.save(str(replay_path))
 
         meta = {
             "iteration": iteration,
             "buffer_size": len(self.replay_buffer),
+            "optimizer_step_count": self._optimizer_step_count,
+            "replay_buffer_path": str(replay_path),
         }
         meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -421,7 +529,7 @@ class AlphaZeroTrainer:
         return str(pt_path)
 
     def load_checkpoint(self, path: str) -> None:
-        """Load network weights (and optionally optimizer) from a checkpoint."""
+        """Load network, optimizer, replay buffer, and iteration state if present."""
         from .alphazero_network import AlphaZeroNetwork
 
         net = AlphaZeroNetwork.load(path)
@@ -433,4 +541,14 @@ class AlphaZeroTrainer:
             self.optimizer.load_state_dict(
                 torch.load(str(optim_path), map_location=self.device, weights_only=True)
             )
+        meta_path = Path(path).parent / (Path(path).stem + "_meta.json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            self._iteration = int(meta.get("iteration", self._iteration))
+            self._optimizer_step_count = int(
+                meta.get("optimizer_step_count", self._optimizer_step_count)
+            )
+            replay_path = meta.get("replay_buffer_path")
+            if replay_path and Path(replay_path).exists():
+                self.replay_buffer.load(replay_path)
         print(f"Loaded checkpoint: {path}")

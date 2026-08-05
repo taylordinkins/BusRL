@@ -453,3 +453,51 @@ The initial implementation calls the network once per simulation at leaf expansi
 3. **Expand + backprop** — expand and backpropagate in reverse for all simulations
 
 This requires tracking virtual losses during the walk to prevent all simulations from collapsing to the same path. Defer until serial implementation is validated and profiling confirms this is the bottleneck.
+
+---
+
+## TODO: PPO Bootstrap (Option 2 — if AlphaZero cold-start stalls)
+
+**When to consider this**: If `eval/avg_rank` does not trend above 0.50–0.51 by iteration 30 of Run 1
+despite the 1a/1b fixes, it means the value head is still receiving insufficient differentiated signal
+and MCTS is operating near-randomly. In that case, pre-warming AlphaZeroNetwork with a PPO-trained
+policy via behavioral cloning (BC) is the recommended next step.
+
+**Why direct weight transfer won't work**: SB3's MaskablePPO uses a separate `FlattenExtractor` trunk,
+a single-player critic, and no LayerNorm — architecture is incompatible with AlphaZeroNetwork's shared
+trunk + multi-player value head. BC sidesteps this by treating the PPO policy purely as a data source.
+
+**Procedure**:
+
+1. **Train MaskablePPO** using `scripts/train.py` until the policy can reliably deliver passengers
+   (watch for mean episode reward rising above 0 in training logs). A few million timesteps is usually
+   sufficient to get a policy that occasionally delivers.
+
+2. **Collect BC game records**: Write a script that loads the trained SB3 model and runs N games
+   (suggested: 500–2000) using the PPO policy greedily (argmax of masked logits). For each step record:
+   - `obs` (the current observation)
+   - `head_id` (from `env._get_decision_context()`)
+   - `action_probs` (masked softmax of PPO logits — use `ppo.policy.get_distribution(obs_t, action_masks=mask_t).distribution.probs`)
+   - At game end, compute `z` via `_compute_rank_vector(env)` from `rl/alphazero_self_play.py` and
+     attach it to every step in that game.
+
+3. **Supervised pre-training of AlphaZeroNetwork**: Train a fresh AlphaZeroNetwork on the collected
+   records for a few epochs:
+   - Policy loss: `F.cross_entropy(logits, ppo_probs)` — teach the trunk to reproduce PPO's masked distribution
+   - Value loss: `F.mse_loss(value, z_targets)` — teach the value head from PPO-generated game outcomes
+   - Use `lr=1e-3`, `weight_decay=1e-4`, `max_grad_norm=1.0` (same as Run 1 hyperparameters)
+   - Stop when policy loss plateaus (usually 5–15 epochs over the dataset)
+
+4. **Hand off to AlphaZero**: Save the BC-warmed network and pass it to Run 1 via
+   `--initial_checkpoint logs/bc_warmstart/network.pt`. MCTS on top of a delivery-aware policy will
+   find scoring lines within the simulation budget and immediately produce differentiated z targets.
+
+**Key files involved**:
+- `rl/alphazero_self_play.py` — `_compute_rank_vector` for computing z from PPO game records
+- `rl/alphazero_network.py` — `AlphaZeroNetwork.save/load` for checkpoint hand-off
+- `scripts/train.py` — existing PPO training pipeline
+- `scripts/train_mcts.py` — Run 1 entry point; accepts `--initial_checkpoint`
+
+**Note on `--use_reward_shaping` during BC warm-start**: Once the BC checkpoint is loaded, keep
+`--use_reward_shaping` enabled for Run 1. The shaped z blend (alpha=0.15) is complementary — it
+provides within-game differentiation even in games where the now-trained policy doesn't deliver.

@@ -11,6 +11,7 @@ Smoke test (should complete in <5 minutes):
 import argparse
 import os
 import sys
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,6 +82,37 @@ def main(args: argparse.Namespace) -> None:
     if args.initial_checkpoint:
         print(f"Loading initial checkpoint: {args.initial_checkpoint}")
         network = AlphaZeroNetwork.load(args.initial_checkpoint)
+        # Print loaded config and warn on any mismatch with CLI args
+        cfg = network.config
+        print(
+            f"  Checkpoint config: obs_dim={cfg.obs_dim}, num_actions={cfg.num_actions}, "
+            f"num_players={cfg.num_players}, trunk_layers={cfg.trunk_layers}, "
+            f"use_per_phase_heads={cfg.use_per_phase_heads}"
+        )
+        mismatches: list[str] = []
+        if cfg.use_per_phase_heads != args.use_per_phase_heads:
+            mismatches.append(
+                f"use_per_phase_heads: checkpoint={cfg.use_per_phase_heads}, "
+                f"arg={args.use_per_phase_heads}"
+            )
+        if cfg.obs_dim != obs_config.total_observation_dim:
+            mismatches.append(
+                f"obs_dim: checkpoint={cfg.obs_dim}, "
+                f"current env={obs_config.total_observation_dim} "
+                f"(check --use_slot_actionability)"
+            )
+        if list(cfg.trunk_layers) != list(args.trunk_layers):
+            mismatches.append(
+                f"trunk_layers: checkpoint={cfg.trunk_layers}, arg={args.trunk_layers}"
+            )
+        if cfg.num_players != args.num_players:
+            mismatches.append(
+                f"num_players: checkpoint={cfg.num_players}, arg={args.num_players}"
+            )
+        if mismatches:
+            print("WARNING: checkpoint config differs from CLI args (checkpoint config is used):")
+            for m in mismatches:
+                print(f"  {m}")
         network.to(device)
     else:
         network = AlphaZeroNetwork(net_config, head_catalog_sizes=head_catalog_sizes)
@@ -98,6 +130,10 @@ def main(args: argparse.Namespace) -> None:
         dirichlet_alpha=args.dirichlet_alpha,
         dirichlet_epsilon=args.dirichlet_epsilon,
         num_players=args.num_players,
+        rollout_steps=args.rollout_steps,
+        rollout_reward_weight=args.rollout_reward_weight,
+        rollout_reward_scale=args.rollout_reward_scale,
+        rollout_to_round_end=args.rollout_to_round_end,
     )
 
     # ── Training config ───────────────────────────────────────────────────────
@@ -120,6 +156,9 @@ def main(args: argparse.Namespace) -> None:
         checkpoint_dir=args.checkpoint_dir,
         save_every_n_iterations=args.save_every,
         use_reward_shaping=args.use_reward_shaping,
+        kl_weight_initial=args.kl_weight,
+        kl_total_iters=args.kl_total_iters,
+        bc_rounds=args.bc_rounds,
         tensorboard=args.tensorboard,
         self_play_verbose=True,
         self_play_progress_every=args.self_play_progress_every,
@@ -134,10 +173,20 @@ def main(args: argparse.Namespace) -> None:
         env_factory=env_factory,
         mcts_config=mcts_config,
         device=device,
+        bc_checkpoint_path=args.bc_checkpoint,
     )
 
     if args.initial_checkpoint:
-        trainer._prev_checkpoint_path = args.initial_checkpoint
+        incumbent_path = Path(args.checkpoint_dir) / "incumbent.pt"
+        if incumbent_path.exists():
+            # Restart after a previous run: resume the promoted incumbent along
+            # with optimizer/replay/iteration state from the checkpoint sidecars.
+            print(f"Incumbent found; resuming from {incumbent_path} instead of initial checkpoint.")
+            trainer.load_checkpoint(str(incumbent_path))
+        else:
+            # First run: no incumbent yet — use the supplied checkpoint as the
+            # self-play reference (typically the BC warmstart).
+            trainer._prev_checkpoint_path = args.initial_checkpoint
 
     trainer.train(n_iterations=args.iterations)
 
@@ -181,6 +230,21 @@ if __name__ == "__main__":
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
     parser.add_argument("--temperature_threshold", type=int, default=30,
                         help="Switch to greedy selection after this many moves")
+    # Rollout-augmented leaf evaluation (4.2 / 4.3)
+    parser.add_argument("--rollout_steps", type=int, default=0,
+                        help="Greedy policy steps from leaf before querying value net "
+                             "(0 = disabled). Bypasses the horizon problem during bootstrap.")
+    parser.add_argument("--rollout_reward_weight", type=float, default=0.0,
+                        help="Blend weight for rollout reward signal vs network value "
+                             "(0.0 = pure network, 1.0 = pure rollout)")
+    parser.add_argument("--rollout_reward_scale", type=float, default=0.25,
+                        help="Magnitude scale for the mean-centered rollout reward signal. "
+                             "Calibrated to delivery_reward=1.0: a single delivery above mean "
+                             "maps to ~0.69 vs ~0.44 for non-deliverers. (default: 0.25)")
+    parser.add_argument("--rollout_to_round_end", action="store_true",
+                        help="Roll forward to the start of the next CHOOSING_ACTIONS round "
+                             "rather than a fixed number of steps. rollout_steps becomes a "
+                             "safety cap (default 60 if 0).")
 
     # ── Optimizer ────────────────────────────────────────────────────────────
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -204,8 +268,24 @@ if __name__ == "__main__":
                         help="Blend step rewards into terminal value targets")
     parser.add_argument("--tensorboard", action="store_true",
                         help="Enable TensorBoard logging")
-    parser.add_argument("--self_play_progress_every", type=int, default=5,
+    parser.add_argument("--self_play_progress_every", type=int, default=1,
                         help="When verbose, print every N completed self-play games")
+    # KL regularization from BC checkpoint (3.2)
+    parser.add_argument("--bc_checkpoint", type=str, default=None,
+                        help="Path to a frozen BC AlphaZeroNetwork .pt file. Used for KL "
+                             "regularization (keeps the policy close to BC prior) and for "
+                             "mid-game curriculum warmup rounds.")
+    parser.add_argument("--kl_weight", type=float, default=0.0,
+                        help="Initial KL divergence weight (KL(BC||current)). Decays linearly "
+                             "to 0 over --kl_total_iters. 0.0 = disabled.")
+    parser.add_argument("--kl_total_iters", type=int, default=100,
+                        help="Iterations over which KL weight decays from --kl_weight to 0.")
+    # Mid-game curriculum (5.1)
+    parser.add_argument("--bc_rounds", type=int, default=0,
+                        help="Play this many rounds with the BC policy (greedy, no MCTS) "
+                             "at the start of each self-play game. MCTS takes over from "
+                             "round bc_rounds+1. Requires --bc_checkpoint. "
+                             "Recommended: 1 in Phase 2, 2 in Phase 3.")
 
     args = parser.parse_args()
     main(args)

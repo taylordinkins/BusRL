@@ -7,7 +7,6 @@ serialization, and state hashing for RL rollouts.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -93,6 +92,19 @@ class GlobalState:
         self.current_resolution_area_idx = 0
         self.current_resolution_slot_idx = 0
         self.round_number += 1
+
+    def clone(self) -> GlobalState:
+        """Create a fast copy of global state for MCTS simulation."""
+        return GlobalState(
+            round_number=self.round_number,
+            current_player_idx=self.current_player_idx,
+            starting_player_idx=self.starting_player_idx,
+            time_clock_position=self.time_clock_position,
+            time_stones_remaining=self.time_stones_remaining,
+            current_resolution_area_idx=self.current_resolution_area_idx,
+            current_resolution_slot_idx=self.current_resolution_slot_idx,
+            game_ended=self.game_ended,
+        )
 
 
 @dataclass
@@ -283,14 +295,20 @@ class GameState:
     # -------------------------------------------------------------------------
 
     def clone(self) -> GameState:
-        """Create a deep copy of the game state.
+        """Create a fast copy of the game state for MCTS simulation.
 
-        Used for RL rollouts and hypothetical state exploration.
-
-        Returns:
-            A complete deep copy of this GameState.
+        Calls hand-written clone() on every component rather than deepcopy,
+        avoiding the memo-dict and isinstance-dispatch overhead of deepcopy.
+        Immutable values (enums, ints, bools) are shared directly.
         """
-        return copy.deepcopy(self)
+        return GameState(
+            board=self.board.clone(),
+            players=[p.clone() for p in self.players],
+            action_board=self.action_board.clone(),
+            passenger_manager=self.passenger_manager.clone(),
+            global_state=self.global_state.clone(),
+            phase=self.phase,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the game state to a dictionary.

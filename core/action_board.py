@@ -111,6 +111,14 @@ class ActionSlot:
         self.player_id = None
         self.placement_order = None
 
+    def clone(self) -> ActionSlot:
+        """Create a fast copy of this action slot for MCTS simulation."""
+        return ActionSlot(
+            label=self.label,
+            player_id=self.player_id,
+            placement_order=self.placement_order,
+        )
+
 
 @dataclass
 class ActionArea:
@@ -170,6 +178,14 @@ class ActionArea:
         """Remove all markers from this area."""
         for slot in self.slots.values():
             slot.clear()
+
+    def clone(self) -> ActionArea:
+        """Create a fast copy of this action area for MCTS simulation."""
+        return ActionArea(
+            area_type=self.area_type,
+            slots={label: slot.clone() for label, slot in self.slots.items()},
+            max_slots=self.max_slots,
+        )
 
 
 def _get_max_slots(area_type: ActionAreaType) -> int:
@@ -292,3 +308,10 @@ class ActionBoard:
     def get_resolution_order(self) -> list[ActionAreaType]:
         """Get the fixed order in which action areas are resolved."""
         return ACTION_RESOLUTION_ORDER.copy()
+
+    def clone(self) -> ActionBoard:
+        """Create a fast copy of this action board for MCTS simulation."""
+        return ActionBoard(
+            areas={area_type: area.clone() for area_type, area in self.areas.items()},
+            placement_counter=self.placement_counter,
+        )

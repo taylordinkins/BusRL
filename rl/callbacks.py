@@ -874,6 +874,11 @@ class HeadUsageCallback(BaseCallback):
         self._seen_opportunity_slots: set[tuple[int, int, int, str, str, int]] = set()
         self._episode_counters = defaultdict(int)
         self._internal_steps_total: int = 0
+        # True game score tracking (player.score - time_stones, averaged over all
+        # players per episode since all are the same policy in self-play).
+        self._episode_game_scores: list[float] = []
+        self._episode_max_game_scores: list[float] = []
+        self._episode_raw_scores: list[float] = []
 
     def _on_training_start(self) -> None:
         labels = ", ".join(
@@ -1025,9 +1030,24 @@ class HeadUsageCallback(BaseCallback):
                             self._waste_total += wasted
         if dones is not None:
             done_arr = np.atleast_1d(dones)
+            infos_list = list(infos) if infos else []
             for env_idx, done in enumerate(done_arr):
                 if done:
                     self._episode_counters[env_idx] += 1
+                    if env_idx < len(infos_list):
+                        ep_info = infos_list[env_idx]
+                        ep_scores = ep_info.get("scores", {})
+                        ep_stones = ep_info.get("time_stones", {})
+                        if ep_scores:
+                            adjusted = [
+                                ep_scores[pid] - ep_stones.get(pid, 0)
+                                for pid in ep_scores
+                            ]
+                            self._episode_game_scores.append(float(np.mean(adjusted)))
+                            self._episode_max_game_scores.append(float(np.max(adjusted)))
+                            self._episode_raw_scores.append(
+                                float(np.mean(list(ep_scores.values())))
+                            )
         return True
 
     def _on_rollout_end(self) -> None:
@@ -1103,6 +1123,19 @@ class HeadUsageCallback(BaseCallback):
         self.logger.record("rollout/wasted_markers_total", self._waste_total)
         self.logger.record("rollout/internal_steps_total", self._internal_steps_total)
 
+        if self._episode_game_scores:
+            self.logger.record(
+                "rollout/mean_game_score", float(np.mean(self._episode_game_scores))
+            )
+        if self._episode_max_game_scores:
+            self.logger.record(
+                "rollout/max_game_score", float(np.mean(self._episode_max_game_scores))
+            )
+        if self._episode_raw_scores:
+            self.logger.record(
+                "rollout/mean_raw_score", float(np.mean(self._episode_raw_scores))
+            )
+
         self._counts = {head: 0 for head in HeadId}
         self._marker_area_counts = {}
         self._opportunity_area_counts = {}
@@ -1113,6 +1146,9 @@ class HeadUsageCallback(BaseCallback):
         self._seen_waste_rounds = set()
         self._seen_opportunity_slots = set()
         self._internal_steps_total = 0
+        self._episode_game_scores = []
+        self._episode_max_game_scores = []
+        self._episode_raw_scores = []
 
 
 class EvalStatsCallback(BaseCallback):
@@ -1130,6 +1166,7 @@ class EvalStatsCallback(BaseCallback):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.eval_freq = max(1, int(eval_freq))
+        self._next_eval_at = self.eval_freq
         self.n_eval_episodes = max(1, int(n_eval_episodes))
         self.deterministic = bool(deterministic)
         # When provided, write per-slot resolution detail for every eval episode
@@ -1150,6 +1187,9 @@ class EvalStatsCallback(BaseCallback):
 
     def _run_eval(self) -> None:
         score_diffs: list[float] = []
+        game_scores: list[float] = []   # mean(player.score - time_stones) per episode
+        max_game_scores: list[float] = []  # winning adjusted score per episode
+        raw_scores: list[float] = []    # mean(player.score) per episode (pre-time-stone)
         head_counts = {head: 0 for head in HeadId}
         total_steps = 0
         marker_area_counts: dict[str, int] = {}
@@ -1318,6 +1358,12 @@ class EvalStatsCallback(BaseCallback):
                     score_diffs.append(final_scores[0] - final_scores[1])
                 else:
                     score_diffs.append(0.0)
+                # Track mean adjusted and raw game score across all players per episode.
+                game_scores.append(float(np.mean(final_scores)))
+                max_game_scores.append(float(final_scores[0]))
+                raw_scores.append(
+                    float(np.mean([scores[pid] for pid in scores]))
+                )
 
         # Write per-slot resolution debug records if requested
         if self.debug_waste_log_path and _debug_records:
@@ -1331,6 +1377,12 @@ class EvalStatsCallback(BaseCallback):
 
         if score_diffs:
             self.logger.record("eval/score_diff_top2", float(np.mean(score_diffs)))
+        if game_scores:
+            self.logger.record("eval/mean_game_score", float(np.mean(game_scores)))
+        if max_game_scores:
+            self.logger.record("eval/max_game_score", float(np.mean(max_game_scores)))
+        if raw_scores:
+            self.logger.record("eval/mean_raw_score", float(np.mean(raw_scores)))
 
         for head, count in head_counts.items():
             short = f"h{head.value}"
@@ -1390,6 +1442,7 @@ class EvalStatsCallback(BaseCallback):
     def _on_step(self) -> bool:
         if self.eval_freq <= 0:
             return True
-        if self.num_timesteps % self.eval_freq == 0:
+        if self.num_timesteps >= self._next_eval_at:
+            self._next_eval_at = self.num_timesteps + self.eval_freq
             self._run_eval()
         return True

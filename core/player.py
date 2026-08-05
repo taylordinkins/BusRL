@@ -120,3 +120,17 @@ class Player:
     def has_resources(self) -> bool:
         """Check if the player has any action markers remaining."""
         return self.action_markers_remaining > 0
+
+    def clone(self) -> Player:
+        """Create a fast copy of this player for MCTS simulation."""
+        return Player(
+            player_id=self.player_id,
+            action_markers_remaining=self.action_markers_remaining,
+            rail_segments_remaining=self.rail_segments_remaining,
+            buses=self.buses,
+            score=self.score,
+            time_stones=self.time_stones,
+            has_passed=self.has_passed,
+            markers_placed_this_round=self.markers_placed_this_round,
+            network_endpoints=set(self.network_endpoints),
+        )

@@ -119,3 +119,17 @@ class PassengerManager:
                 locations[passenger.location] = []
             locations[passenger.location].append(passenger.passenger_id)
         return locations
+
+    def clone(self) -> PassengerManager:
+        """Create a fast copy of the passenger manager for MCTS simulation.
+
+        Uses object.__new__ to bypass the custom __init__ (which always
+        creates a fresh empty state) so we can set the cloned values directly.
+        """
+        new_mgr = object.__new__(PassengerManager)
+        new_mgr._next_id = self._next_id
+        new_mgr.passengers = {
+            pid: Passenger(passenger_id=p.passenger_id, location=p.location)
+            for pid, p in self.passengers.items()
+        }
+        return new_mgr

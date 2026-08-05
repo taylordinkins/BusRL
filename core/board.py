@@ -8,7 +8,6 @@ The board is represented as a static attributed graph:
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -386,9 +385,14 @@ class BoardGraph:
         return count
 
     def clone(self) -> BoardGraph:
-        """Create a deep copy of this board graph."""
+        """Create a copy of this board graph for MCTS simulation.
+
+        nodes and edges are cloned element-wise (mutable occupancy state).
+        adjacency is shared by reference — it is immutable after board load
+        and copying it per-clone would be needlessly expensive.
+        """
         new_board = BoardGraph()
         new_board.nodes = {node_id: node.clone() for node_id, node in self.nodes.items()}
         new_board.edges = {edge_id: edge.clone() for edge_id, edge in self.edges.items()}
-        new_board.adjacency = {node_id: set(neighbors) for node_id, neighbors in self.adjacency.items()}
+        new_board.adjacency = self.adjacency  # immutable topology; safe to share
         return new_board

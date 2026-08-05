@@ -14,8 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
-from core.constants import Phase, ActionAreaType
+from core.constants import Phase, ActionAreaType, TIME_CLOCK_ORDER
 from .config import RewardConfig, DEFAULT_REWARD_CONFIG, BoardConfig, DEFAULT_BOARD_CONFIG
+from .delivery_utils import compute_delivery_features
 
 if TYPE_CHECKING:
     from core.game_state import GameState
@@ -40,6 +41,9 @@ class StepRewardInfo:
     # Resolution-time Type 1 waste penalty (injected by BusEnv, not RewardCalculator)
     resolution_waste_penalty: float = 0.0
     terminal_reward: float = 0.0
+    # Vrroomm passenger selection bonus (small shaping at stage 1 for choosing
+    # a passenger that has a valid delivery destination)
+    vrroomm_passenger_selection_bonus: float = 0.0
 
     @property
     def total(self) -> float:
@@ -56,6 +60,7 @@ class StepRewardInfo:
             + self.resolve_progress_bonus
             + self.resolution_waste_penalty
             + self.terminal_reward
+            + self.vrroomm_passenger_selection_bonus
         )
 
 
@@ -149,6 +154,12 @@ class RewardCalculator:
             info.stolen_bonus = stolen
             info.exclusive_bonus = exclusive
 
+            # Vrroomm passenger selection shaping (stage 1)
+            if action_info.get("vrroomm_passenger_has_destination"):
+                info.vrroomm_passenger_selection_bonus = float(
+                    self.config.vrroomm_passenger_selection_bonus
+                )
+
         # Check for new train station connections
         info.station_connection_reward = self._check_station_connections(
             state, player_id
@@ -161,7 +172,9 @@ class RewardCalculator:
 
         # Dense shaping for choosing marker placements: reward actionable slots,
         # penalize placements that are guaranteed wasted under current M#oB.
-        marker_bonus, waste_penalty = self._compute_marker_shaping(state, action_info)
+        marker_bonus, waste_penalty = self._compute_marker_shaping(
+            state, player_id, action_info
+        )
         info.marker_opportunity_bonus = marker_bonus
         info.avoidable_waste_penalty = waste_penalty
 
@@ -178,12 +191,16 @@ class RewardCalculator:
     def _compute_marker_shaping(
         self,
         state: "GameState",
+        player_id: int,
         action_info: Optional[dict],
     ) -> tuple[float, float]:
         """Compute shaping on marker placement quality.
 
         Applies only to M#oB-scaled resolution areas where late slots can become
         guaranteed waste: Line Expansion, Passengers, Buildings.
+
+        For Vrroomm: uses tiered, state-conditioned bonuses instead of the old
+        unconditional flat bonus.
         """
         if not action_info:
             return 0.0, 0.0
@@ -198,10 +215,9 @@ class RewardCalculator:
         if area == "starting_player":
             return float(self.config.starting_player_bonus), 0.0
 
-        # VRROOMM area: always signal positively at placement time
-        # (player only places here when deliveries are possible) - TODO: IS THIS TRUE?
+        # VRROOMM area: tiered, state-conditioned bonus
         if area == "vrroomm":
-            return float(self.config.vrroomm_placement_bonus), 0.0
+            return float(self._compute_vrroomm_placement_bonus(state, player_id)), 0.0
 
         # M#oB-scaled areas require slot index to determine actionability
         slot_label = action_info.get("placed_marker_slot")
@@ -221,6 +237,46 @@ class RewardCalculator:
         if actionable:
             return float(self.config.marker_opportunity_bonus), 0.0
         return 0.0, float(self.config.avoidable_waste_penalty)
+
+    def _compute_vrroomm_placement_bonus(
+        self,
+        state: "GameState",
+        player_id: int,
+    ) -> float:
+        """Compute tiered, state-conditioned Vrroomm placement bonus.
+
+        Tier 1 (confirmed): ≥1 deliverable passenger for current or next clock → +vrroomm_bonus_confirmed
+        Tier 2 (probable): train station on network + available delivery slots → +vrroomm_bonus_probable
+        Tier 0: no opportunity → 0.0
+
+        Checking both current and next clock types handles the common case where the
+        clock advances before Vrroomm resolves.
+        """
+        current_type = state.global_state.time_clock_position
+        clock_idx = TIME_CLOCK_ORDER.index(current_type)
+        next_type = TIME_CLOCK_ORDER[(clock_idx + 1) % len(TIME_CLOCK_ORDER)]
+
+        df_current = compute_delivery_features(state, player_id, current_type)
+        df_next = compute_delivery_features(state, player_id, next_type)
+
+        # Tier 1: confirmed deliverable passengers for current or next clock
+        if df_current.deliverable_count > 0 or df_next.deliverable_count > 0:
+            return self.config.vrroomm_bonus_confirmed
+
+        # Tier 2: train station on network AND delivery slots available
+        network_nodes = state.board.get_player_network_nodes(player_id)
+        has_station = any(
+            state.board.get_node(nid).is_train_station
+            for nid in network_nodes
+        )
+        has_slots = (
+            df_current.available_slot_count > 0
+            or df_next.available_slot_count > 0
+        )
+        if has_station and has_slots:
+            return self.config.vrroomm_bonus_probable
+
+        return 0.0
 
     def _compute_resolution_progress_bonus(
         self,
@@ -438,17 +494,30 @@ class RewardCalculator:
             state: "GameState",
             player_id: int,
         ) -> float:
-        """Compute terminal reward based on point differential with draw handling.
+        """Compute terminal reward.
 
-        Rewards:
+        Two modes, controlled by RewardConfig.use_score_based_terminal:
+
+        Score-based (use_score_based_terminal=True):
+            terminal = (player.score - time_stones) * terminal_score_scale
+            Rewards absolute delivery count; completely decoupled from opponent
+            performance. won_game_bonus / draw_bonus / second_place_bonus are
+            ignored. Avoids the "win without scoring" pathology that arises when
+            PFSP pool play optimises rank-differential rather than raw output.
+
+        Rank-differential (use_score_based_terminal=False, default):
         • Win: (first - second) + won_game_bonus
         • Draw (tie for first): draw_bonus
         • Second place: (score - first) + second_place_bonus
         • Others: (score - first)
-
-        This ensures:
-        win > draw > second > others
+        This ensures: win > draw > second > others
         """
+
+        # ---- Score-based terminal (absolute, no opponent context) ----
+        if getattr(self.config, "use_score_based_terminal", False):
+            player_obj = state.get_player(player_id)
+            player_score = player_obj.score - player_obj.time_stones
+            return float(player_score * self.config.terminal_score_scale)
 
         # ---- Compute final scores ----
         final_scores = []

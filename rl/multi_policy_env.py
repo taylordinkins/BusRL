@@ -940,7 +940,7 @@ class MultiPolicyBusEnv(gym.Wrapper):
     #             games_played_delta=1,
     #         )
     def _update_elo_ratings(self, info: dict) -> None:
-        """Update Elo ratings after a multiplayer game ends, including seat-averaged win rates."""
+        """Update skill ratings after a multiplayer game using adjusted game score."""
 
         if self.elo_tracker is None:
             return
@@ -948,12 +948,16 @@ class MultiPolicyBusEnv(gym.Wrapper):
         scores = info.get("scores", None)
         if not scores:
             return
+        time_stones = info.get("time_stones", {})
 
         player_ids = self._current_episode_checkpoints
         num_players = len(player_ids)
 
-        # Extract final scores in seat order
-        final_scores = [scores.get(i, 0) for i in range(num_players)]
+        # Extract adjusted game scores (score - time stones) in seat order.
+        final_scores = [
+            float(scores.get(i, 0) - time_stones.get(i, 0))
+            for i in range(num_players)
+        ]
 
         # 1) Update multiplayer Elo properly
         self.elo_tracker.update_ratings_multiplayer(player_ids, final_scores)
@@ -1040,6 +1044,14 @@ class MatchRunner:
         """
         self.env_factory = env_factory
         self.elo_tracker = elo_tracker
+
+    @staticmethod
+    def _adjust_scores(scores: dict, time_stones: dict, num_players: int) -> list[float]:
+        """Convert final board scores into adjusted game scores."""
+        return [
+            float(scores.get(i, 0) - time_stones.get(i, 0))
+            for i in range(num_players)
+        ]
 
     def run_match(
         self,
@@ -1223,14 +1235,18 @@ class MatchRunner:
         # Get final scores
         final_info = env._get_info() if hasattr(env, "_get_info") else info
         scores = final_info.get("scores", {i: 0 for i in range(num_players)})
+        time_stones = final_info.get("time_stones", {i: 0 for i in range(num_players)})
 
         env.close()
 
-        # Aggregate scores by policy: average across all seats each policy occupied
+        adjusted_scores = self._adjust_scores(scores, time_stones, num_players)
+
+        # Aggregate adjusted game scores by policy: average across all seats each
+        # policy occupied.
         score_sums: dict[str, float] = {}
         score_counts: dict[str, int] = {}
         for seat, ckpt_id in enumerate(expanded_checkpoint_ids):
-            score_sums[ckpt_id] = score_sums.get(ckpt_id, 0.0) + scores.get(seat, 0)
+            score_sums[ckpt_id] = score_sums.get(ckpt_id, 0.0) + adjusted_scores[seat]
             score_counts[ckpt_id] = score_counts.get(ckpt_id, 0) + 1
         avg_scores = {ckpt_id: score_sums[ckpt_id] / score_counts[ckpt_id] for ckpt_id in score_sums}
 

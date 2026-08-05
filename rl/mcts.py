@@ -18,6 +18,8 @@ from typing import Optional, TYPE_CHECKING
 
 import numpy as np
 
+from .alphazero_self_play import _compute_rank_vector
+
 if TYPE_CHECKING:
     from .alphazero_network import AlphaZeroNetwork
     from .bus_env import BusEnv
@@ -32,6 +34,11 @@ class MCTSConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25   # 0.0 disables noise (use for eval)
     num_players: int = 4
+    # Rollout-augmented leaf evaluation (4.2 / 4.3)
+    rollout_steps: int = 0            # >0: greedy steps from leaf before querying value net
+    rollout_reward_weight: float = 0.0  # blend weight: rollout reward signal vs network value
+    rollout_reward_scale: float = 0.25  # magnitude scale for reward signal; calibrated to delivery_reward=1.0
+    rollout_to_round_end: bool = False  # if True, roll until start of next CHOOSING_ACTIONS round
 
 
 class MCTSNode:
@@ -249,6 +256,11 @@ class AlphaZeroMCTS:
             values = self._get_terminal_values(node.env)
         else:
             priors, values = self._get_priors_and_value(node.env)
+            use_rollout = (
+                self.config.rollout_to_round_end or self.config.rollout_steps > 0
+            )
+            if use_rollout and not node.is_expanded:
+                values = self._get_value_with_rollout(node.env)
             if not node.is_expanded:
                 node.expand(priors)
 
@@ -277,30 +289,87 @@ class AlphaZeroMCTS:
         z[i] = (num_players - rank[i]) / (num_players - 1)
         Ties get the average rank of the tied positions.
         """
-        state = env._engine.state
-        scores = {p.player_id: p.score for p in state.players}
-        n = len(scores)
+        return _compute_rank_vector(env)
 
-        sorted_items = sorted(scores.items(), key=lambda x: -x[1])
+    def _get_value_with_rollout(self, env: "BusEnv") -> np.ndarray:
+        """Run a greedy policy rollout from a leaf, then query the value network.
 
-        ranks: dict[int, float] = {}
-        i = 0
-        while i < n:
-            j = i
-            while j < n and sorted_items[j][1] == sorted_items[i][1]:
-                j += 1
-            # 1-indexed average rank for positions i..j-1 (0-indexed in sorted order)
-            avg_rank = (i + 1 + j) / 2
-            for k in range(i, j):
-                ranks[sorted_items[k][0]] = avg_rank
-            i = j
+        Two stopping modes (controlled by MCTSConfig):
+          - rollout_to_round_end=True: roll until the start of the next
+            CHOOSING_ACTIONS round (semantically one complete resolution cycle).
+            Uses rollout_steps as a safety cap (default 60).
+          - rollout_steps > 0: fixed number of greedy steps.
 
-        values = np.zeros(n, dtype=np.float32)
-        denom = max(n - 1, 1)
-        for player_id, rank in ranks.items():
-            values[player_id] = (n - rank) / denom
+        Accumulated per-player step rewards can optionally be blended into the
+        returned value vector via rollout_reward_weight.
+        """
+        rollout_env = env.clone()
+        n = self.config.num_players
+        cumulative_rewards = np.zeros(n, dtype=np.float32)
 
-        return values
+        if self.config.rollout_to_round_end:
+            # Safety cap: rollout_steps used as max steps, default 60 if 0
+            max_steps = self.config.rollout_steps if self.config.rollout_steps > 0 else 60
+            if rollout_env._engine is None or rollout_env._engine.is_game_over():
+                return self._get_terminal_values(rollout_env)
+            initial_round = rollout_env._engine.state.global_state.round_number
+            for step in range(max_steps):
+                if rollout_env._engine is None or rollout_env._engine.is_game_over():
+                    return self._get_terminal_values(rollout_env)
+                # Stop at the start of the next CHOOSING_ACTIONS phase
+                if step > 0:
+                    from core.constants import Phase
+                    current_phase = rollout_env._engine.state.phase
+                    current_round = rollout_env._engine.state.global_state.round_number
+                    if (
+                        current_phase == Phase.CHOOSING_ACTIONS
+                        and current_round > initial_round
+                    ):
+                        break
+                priors, _ = self._get_priors_and_value(rollout_env)
+                mask = rollout_env.action_masks()[:len(priors)]
+                priors[~mask] = 0.0
+                total = priors.sum()
+                current_player = rollout_env.get_current_player()
+                action = int(np.argmax(priors)) if total > 0 else int(np.where(mask)[0][0])
+                _, reward, terminated, truncated, _ = rollout_env.step(action)
+                cumulative_rewards[current_player] += float(reward)
+                if terminated or truncated:
+                    return self._get_terminal_values(rollout_env)
+        else:
+            for _ in range(self.config.rollout_steps):
+                if rollout_env._engine is None or rollout_env._engine.is_game_over():
+                    return self._get_terminal_values(rollout_env)
+                priors, _ = self._get_priors_and_value(rollout_env)
+                mask = rollout_env.action_masks()[:len(priors)]
+                priors[~mask] = 0.0
+                total = priors.sum()
+                current_player = rollout_env.get_current_player()
+                action = int(np.argmax(priors)) if total > 0 else int(np.where(mask)[0][0])
+                _, reward, terminated, truncated, _ = rollout_env.step(action)
+                cumulative_rewards[current_player] += float(reward)
+                if terminated or truncated:
+                    return self._get_terminal_values(rollout_env)
+
+        _, values = self._get_priors_and_value(rollout_env)
+
+        if self.config.rollout_reward_weight > 0:
+            # Magnitude-preserving reward signal.
+            # Center rewards across players so the signal is relative (zero-sum
+            # in deviation), then scale conservatively and squash to [0, 1].
+            # All-zero rollouts → everyone gets 0.5 (no spurious gradient).
+            # A single delivery above mean → ~0.69 vs ~0.44 for non-deliverers.
+            # Tiny shaping-only spreads → signal stays nearly flat (no rank
+            # amplification of noise).
+            # rollout_reward_scale is calibrated to delivery_reward=1.0.
+            r = cumulative_rewards.astype(np.float32)
+            r_centered = r - r.mean()
+            reward_signal = 0.5 + self.config.rollout_reward_scale * np.clip(r_centered, -2.0, 2.0)
+            reward_signal = np.clip(reward_signal, 0.0, 1.0)
+            w = self.config.rollout_reward_weight
+            values = (1 - w) * values + w * reward_signal
+
+        return np.clip(values, 0.0, 1.0)
 
     def _policy_only_action(
         self,

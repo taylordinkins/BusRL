@@ -75,6 +75,14 @@ class ObservationConfig:
     # this flag — use only at a fresh checkpoint boundary.
     use_slot_actionability: bool = False
 
+    # Optional delivery-viability features (ppo_enhancements.md Priority 1).
+    # When True, adds 2 features per passenger (is_reachable_by_current_player,
+    # is_valid_delivery_source) and 3 global features (my_deliverable_count_current,
+    # my_deliverable_count_next_clock, my_available_slots_current).
+    # Total obs dim increase: 15*2 + 3 = 33.
+    # Incompatible with checkpoints trained without this flag.
+    use_delivery_features: bool = False
+
     @property
     def node_features_size(self) -> int:
         """Total size of node features tensor."""
@@ -96,6 +104,11 @@ class ObservationConfig:
         return self.SLOT_FEATURE_DIM + (1 if self.use_slot_actionability else 0)
 
     @property
+    def passenger_feature_dim(self) -> int:
+        """Effective passenger feature dimension (5 base + 2 if use_delivery_features)."""
+        return self.PASSENGER_FEATURE_DIM + (2 if self.use_delivery_features else 0)
+
+    @property
     def action_board_size(self) -> int:
         """Total size of action board tensor."""
         return self.ACTION_AREAS * self.MAX_SLOTS_PER_AREA * self.slot_feature_dim
@@ -103,12 +116,17 @@ class ObservationConfig:
     @property
     def passenger_features_size(self) -> int:
         """Total size of passenger features tensor."""
-        return self.MAX_PASSENGERS * self.PASSENGER_FEATURE_DIM
+        return self.MAX_PASSENGERS * self.passenger_feature_dim
 
     @property
     def global_features_size(self) -> int:
-        """Total size of global state tensor."""
-        return self.GLOBAL_FEATURE_DIM
+        """Total size of global state tensor.
+
+        Base: GLOBAL_FEATURE_DIM (39).
+        With use_delivery_features: +3 (my_deliverable_count_current,
+        my_deliverable_count_next_clock, my_available_slots_current).
+        """
+        return self.GLOBAL_FEATURE_DIM + (3 if self.use_delivery_features else 0)
 
     @property
     def total_observation_dim(self) -> int:
@@ -294,34 +312,66 @@ class RewardConfig:
     exclusive_delivery_bonus: float = 0.08
 
     # Network building rewards
-    station_connection_reward: float = 0.05
+    # NOTE (sparse-reward run): zeroed out — station connections are a proxy signal
+    # that no longer adds value at post-priming skill level.
+    station_connection_reward: float = 0.0
 
     # Penalties
     time_stone_penalty: float = 0.0
     invalid_action_penalty: float = -1.0
 
     # Marker placement shaping (early training signal)
-    marker_opportunity_bonus: float = 0.05
-    avoidable_waste_penalty: float = -0.005
+    # NOTE (sparse-reward run): zeroed out — placement shaping was producing
+    # declining Vrroomm quality (reward yield/marker fell from 0.13→0.10 in Phase 2).
+    # Policy derives marker placement from delivery outcomes directly.
+    marker_opportunity_bonus: float = 0.0
+    avoidable_waste_penalty: float = 0.0
 
     # Resolution-time waste penalty (Type 1: slot index >= M#oB, fires at resolution)
-    resolution_type1_waste_penalty: float = -0.03
+    # NOTE (sparse-reward run): zeroed out alongside other placement shaping.
+    resolution_type1_waste_penalty: float = 0.0
 
     # Resolve-phase shaping (tiny progression incentives)
-    resolve_line_expansion_bonus: float = 0.005
-    resolve_passengers_bonus: float = 0.0005
-    resolve_buildings_bonus: float = 0.001
-    vrroomm_placement_bonus: float = 0.005
+    # NOTE (sparse-reward run): zeroed out — these were 0.0005–0.005 and added noise
+    # without meaningful signal at current skill level.
+    resolve_line_expansion_bonus: float = 0.0
+    resolve_passengers_bonus: float = 0.0
+    resolve_buildings_bonus: float = 0.0
+
+    # Vrroomm placement bonuses (tiered, state-conditioned; replaces old flat bonus).
+    # NOTE (sparse-reward run): zeroed out — the +0.06 Tier 1 bonus fires at
+    # CHOOSING_ACTIONS (marker placement) while the +1.0 delivery fires much later
+    # at RESOLVE_VRROOMM_DEST. This temporal gap was reinforcing sub-optimal
+    # placements; removing it forces credit assignment via actual delivery outcomes.
+    vrroomm_placement_bonus: float = 0.0
+    vrroomm_bonus_confirmed: float = 0.0
+    vrroomm_bonus_probable: float = 0.0
+
+    # Bonus for selecting a passenger with a valid delivery destination at
+    # Vrroomm stage 1 (passenger selection). Small shaping signal for the
+    # step that precedes the +1.0 delivery reward at stage 2.
+    # NOTE (sparse-reward run): zeroed out for consistency with full sparse regime.
+    vrroomm_passenger_selection_bonus: float = 0.0
 
     # Starting player bonus (placement-time signal for taking starting player tile)
-    starting_player_bonus: float = 0.03
+    # NOTE (sparse-reward run): zeroed out — placement shaping removed.
+    starting_player_bonus: float = 0.0
 
     # Terminal rewards use point differential (no config needed)
 
     # Add a "Won Game Reward"
-    won_game_bonus = 5.0
-    second_place_bonus = 1.0
-    draw_bonus = 1.5
+    won_game_bonus: float = 5.0
+    second_place_bonus: float = 1.0
+    draw_bonus: float = 1.5
+
+    # Score-based terminal reward (alternative to rank-differential).
+    # When True: terminal = (player.score - time_stones) * terminal_score_scale.
+    # This decouples the terminal signal from opponent performance entirely —
+    # the policy is rewarded for absolute delivery count, not margin of victory.
+    # won_game_bonus / draw_bonus / second_place_bonus are ignored when enabled.
+    # When False: original rank-differential formula is used (default).
+    use_score_based_terminal: bool = False
+    terminal_score_scale: float = 0.5
 
 
 # Default configuration instances

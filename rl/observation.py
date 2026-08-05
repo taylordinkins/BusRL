@@ -25,6 +25,7 @@ from core.constants import (
 )
 from .config import ObservationConfig, DEFAULT_OBS_CONFIG
 from .hierarchical_action_space import HeadId, get_head_id
+from .delivery_utils import compute_delivery_features
 
 
 class ObservationEncoder:
@@ -111,7 +112,7 @@ class ObservationEncoder:
         offset = self._encode_edges(state, current_player_id, obs, offset)
         offset = self._encode_players(state, current_player_id, obs, offset)
         offset = self._encode_action_board(state, current_player_id, obs, offset)
-        offset = self._encode_passengers(state, obs, offset)
+        offset = self._encode_passengers(state, current_player_id, obs, offset)
         offset = self._encode_global(
             state, current_player_id, obs, offset, head_id, vrroomm_stage
         )
@@ -432,18 +433,33 @@ class ObservationEncoder:
 
         return offset + self.config.action_board_size
 
-    def _encode_passengers(self, state: GameState, obs: np.ndarray, offset: int) -> int:
+    def _encode_passengers(
+        self,
+        state: GameState,
+        current_player_id: int,
+        obs: np.ndarray,
+        offset: int,
+    ) -> int:
         """Encode passenger features into observation tensor.
 
-        Passenger features (5 per passenger):
+        Passenger features (5 base, +2 with use_delivery_features):
         - exists (1): binary
         - location_node_idx (1): normalized node index
         - is_at_train_station (1): binary
         - is_at_central_park (1): binary
         - is_at_matching_building (1): binary (matches time clock)
+        - [is_reachable_by_current_player] (1): binary (if use_delivery_features)
+        - [is_valid_delivery_source] (1): binary (if use_delivery_features)
         """
-        feature_dim = self.config.PASSENGER_FEATURE_DIM
+        feature_dim = self.config.passenger_feature_dim
         current_building = state.global_state.time_clock_position
+
+        # Compute delivery features once if enabled
+        delivery_features = None
+        if self.config.use_delivery_features:
+            delivery_features = compute_delivery_features(
+                state, current_player_id, current_building
+            )
 
         # Get passengers sorted by ID for consistent ordering
         sorted_passengers = sorted(
@@ -467,18 +483,25 @@ class ObservationEncoder:
             obs[base + i] = node_idx / max(self.config.MAX_NODES - 1, 1)
             i += 1
 
-            # Is at train station
+            # Is at train station / central park / matching building
             node = state.board.nodes.get(passenger.location)
             if node:
                 obs[base + i] = 1.0 if node.is_train_station else 0.0
                 i += 1
                 obs[base + i] = 1.0 if node.is_central_park else 0.0
                 i += 1
-                # Is at matching building
                 obs[base + i] = 1.0 if node.has_building_type(current_building) else 0.0
                 i += 1
             else:
-                i += 3  # Skip remaining features if node not found
+                i += 3  # Skip remaining base features if node not found
+
+            # Delivery features (optional)
+            if delivery_features is not None:
+                pid = passenger.passenger_id
+                obs[base + i] = 1.0 if delivery_features.passenger_reachable.get(pid, False) else 0.0
+                i += 1
+                obs[base + i] = 1.0 if delivery_features.passenger_valid_source.get(pid, False) else 0.0
+                i += 1
 
         return offset + self.config.passenger_features_size
 
@@ -566,6 +589,26 @@ class ObservationEncoder:
         stage_value = int(vrroomm_stage)
         for s_idx in range(self.config.VRROOMM_STAGE_DIM):
             obs[base + i] = 1.0 if stage_value == (s_idx + 1) else 0.0
+            i += 1
+
+        # Delivery global features (optional; indices 39, 40, 41)
+        if self.config.use_delivery_features:
+            current_building = state.global_state.time_clock_position
+            clock_idx = TIME_CLOCK_ORDER.index(current_building)
+            next_building = TIME_CLOCK_ORDER[(clock_idx + 1) % len(TIME_CLOCK_ORDER)]
+
+            df_current = compute_delivery_features(state, current_player_id, current_building)
+            df_next = compute_delivery_features(state, current_player_id, next_building)
+
+            # my_deliverable_count_current (normalized by MAX_PASSENGERS)
+            obs[base + i] = df_current.deliverable_count / max(self.config.MAX_PASSENGERS, 1)
+            i += 1
+            # my_deliverable_count_next_clock (normalized by MAX_PASSENGERS)
+            obs[base + i] = df_next.deliverable_count / max(self.config.MAX_PASSENGERS, 1)
+            i += 1
+            # my_available_slots_current (normalized by MAX_NODES * MAX_BUILDING_SLOTS_PER_NODE)
+            max_slots = self.config.MAX_NODES * self.config.MAX_BUILDING_SLOTS_PER_NODE
+            obs[base + i] = df_current.available_slot_count / max(max_slots, 1)
             i += 1
 
         return offset + self.config.global_features_size
